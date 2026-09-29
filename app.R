@@ -1,3 +1,4 @@
+# Connect Cloud auto-publish test
 # ============================================================
 # 0050 Investment Research Dashboard
 # 第 1 段：資料、共用函數、UI
