@@ -938,14 +938,14 @@ ui <- fluidPage(
   
   
   div(
-    class = "dashboard-title",
-    "0050 投資組合研究 Dashboard"
-  ),
-  
-  div(
-    class = "dashboard-subtitle",
-    "市場監控、個股分析、產業比較、相關性分析與投資組合模擬"
-  ),
+  class = "dashboard-title",
+  "0050 投資研究 Dashboard"
+),
+
+div(
+  class = "dashboard-subtitle",
+  "以日對數報酬、風險、穩定性與統計方法分析 0050 及其成分股"
+),
   
   
   # ==========================================================
