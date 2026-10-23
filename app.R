@@ -1,4 +1,4 @@
-# 融合版：保留原功能並加入綜合排名、穩定性、主成分與分群
+# 0050 投資研究 Dashboard v2：研究主線＋美編＋不確定性分析＋歷史回測
 # Connect Cloud auto-publish test
 # ============================================================
 # 0050 Investment Research Dashboard
@@ -18,7 +18,7 @@ options(scipen = 999)
 DATA_FILE <- "data/stock_data.rds"
 
 RESEARCH_START_DATE <- as.Date("2016-01-04")
-RESEARCH_END_DATE   <- as.Date("2025-12-31")
+RESEARCH_END_DATE   <- Sys.Date()
 
 TRADING_DAYS_PER_YEAR <- 252
 MAX_SELECTED_STOCKS <- 5
@@ -440,6 +440,154 @@ fmt_score <- function(x, digits = 1) {
   )
 }
 
+
+# ============================================================
+# 3-2. 技術狀態、區塊拔靴法與歷史回測共用函數（v2 新增）
+# ============================================================
+
+# RSI（14 日）簡化計算：僅作為市場狀態輔助，不作買賣建議。
+rsi_value <- function(price, n = 14) {
+  price <- price[is.finite(price)]
+  if (length(price) < n + 1) return(NA_real_)
+  d <- diff(tail(price, n + 1))
+  gain <- mean(pmax(d, 0), na.rm = TRUE)
+  loss <- mean(pmax(-d, 0), na.rm = TRUE)
+  if (!is.finite(gain) || !is.finite(loss)) return(NA_real_)
+  if (loss == 0 && gain > 0) return(100)
+  if (gain == 0 && loss == 0) return(50)
+  rs <- gain / loss
+  100 - 100 / (1 + rs)
+}
+
+# 產生區塊拔靴法索引。區塊會保留連續數日的結構。
+block_bootstrap_indices <- function(n, block_length = 10) {
+  if (n <= 1) return(seq_len(n))
+  block_length <- max(2, min(as.integer(block_length), n))
+  starts <- seq_len(max(1, n - block_length + 1))
+  idx <- integer(0)
+  while (length(idx) < n) {
+    s <- sample(starts, 1)
+    idx <- c(idx, s:min(n, s + block_length - 1))
+  }
+  idx[seq_len(n)]
+}
+
+# 由「日期 × 股票」的日對數報酬矩陣計算研究分數。
+# 這個函數用於區塊拔靴法與歷史回測，計算邏輯與主排名保持同一方向。
+score_return_matrix <- function(return_matrix) {
+  return_matrix <- as.matrix(return_matrix)
+  if (nrow(return_matrix) < 63 || ncol(return_matrix) < 2) return(data.frame())
+  symbols <- colnames(return_matrix)
+  if (is.null(symbols)) symbols <- paste0("S", seq_len(ncol(return_matrix)))
+  period_days <- c(`1週` = 5, `1個月` = 21, `3個月` = 63, `6個月` = 126, `1年` = 252)
+  period_weights <- c(`1週` = 0.05, `1個月` = 0.10, `3個月` = 0.20, `6個月` = 0.25, `1年` = 0.40)
+
+  base_rows <- lapply(seq_along(symbols), function(j) {
+    r <- return_matrix[, j]
+    r <- r[is.finite(r)]
+    if (length(r) < 63) {
+      return(data.frame(symbol=symbols[j], n_obs=length(r), annual_return=NA_real_, annual_volatility=NA_real_, max_drawdown=NA_real_, cvar_95=NA_real_, mean_daily_log=NA_real_, sharpe=NA_real_))
+    }
+    wealth <- exp(cumsum(r))
+    ann_vol <- sd(r, na.rm=TRUE) * sqrt(TRADING_DAYS_PER_YEAR)
+    mean_daily <- mean(r, na.rm=TRUE)
+    data.frame(
+      symbol=symbols[j],
+      n_obs=length(r),
+      annual_return=exp(mean_daily * TRADING_DAYS_PER_YEAR) - 1,
+      annual_volatility=ann_vol,
+      max_drawdown=min(drawdown_value(wealth), na.rm=TRUE),
+      cvar_95=cvar_value(r, 0.95),
+      mean_daily_log=mean_daily,
+      sharpe=ifelse(is.finite(ann_vol) && ann_vol > 0, mean_daily * TRADING_DAYS_PER_YEAR / ann_vol, NA_real_),
+      stringsAsFactors=FALSE
+    )
+  })
+  base <- bind_rows(base_rows)
+
+  period_long <- bind_rows(lapply(names(period_days), function(period_name) {
+    n_day <- period_days[[period_name]]
+    rows <- lapply(seq_along(symbols), function(j) {
+      r <- return_matrix[, j]
+      r <- r[is.finite(r)]
+      if (length(r) < max(3, floor(n_day * 0.75))) {
+        return(data.frame(symbol=symbols[j], period=period_name, period_log_return=NA_real_, annualized_log_mean=NA_real_, annualized_volatility=NA_real_))
+      }
+      rr <- tail(r, min(n_day, length(r)))
+      data.frame(
+        symbol=symbols[j],
+        period=period_name,
+        period_log_return=sum(rr, na.rm=TRUE),
+        annualized_log_mean=mean(rr, na.rm=TRUE) * TRADING_DAYS_PER_YEAR,
+        annualized_volatility=sd(rr, na.rm=TRUE) * sqrt(TRADING_DAYS_PER_YEAR),
+        stringsAsFactors=FALSE
+      )
+    })
+    bind_rows(rows)
+  })) %>%
+    group_by(period) %>%
+    mutate(return_percentile = cross_section_score(period_log_return, TRUE)) %>%
+    ungroup()
+
+  stability_raw <- period_long %>%
+    group_by(symbol) %>%
+    summarise(
+      rank_variation=sd(return_percentile, na.rm=TRUE),
+      return_variation=sd(annualized_log_mean, na.rm=TRUE),
+      risk_variation=sd(annualized_volatility, na.rm=TRUE),
+      valid_periods=sum(is.finite(period_log_return)),
+      .groups="drop"
+    ) %>%
+    mutate(
+      rank_variation=ifelse(valid_periods >= 3, rank_variation, NA_real_),
+      return_variation=ifelse(valid_periods >= 3, return_variation, NA_real_),
+      risk_variation=ifelse(valid_periods >= 3, risk_variation, NA_real_),
+      rank_stability_score=cross_section_score(rank_variation, FALSE),
+      return_stability_score=cross_section_score(return_variation, FALSE),
+      risk_stability_score=cross_section_score(risk_variation, FALSE),
+      stability_score=0.30 * rank_stability_score + 0.40 * return_stability_score + 0.30 * risk_stability_score
+    )
+
+  multi_return <- period_long %>%
+    mutate(weight=period_weights[period]) %>%
+    group_by(symbol) %>%
+    summarise(
+      multi_period_return_score=ifelse(sum(is.finite(return_percentile)) >= 3, weighted.mean(return_percentile, weight, na.rm=TRUE), NA_real_),
+      .groups="drop"
+    )
+
+  base %>%
+    mutate(
+      annual_return_score=cross_section_score(annual_return, TRUE),
+      volatility_score=cross_section_score(annual_volatility, FALSE),
+      drawdown_score=cross_section_score(max_drawdown, TRUE),
+      cvar_score=cross_section_score(cvar_95, TRUE),
+      sharpe_score=cross_section_score(sharpe, TRUE)
+    ) %>%
+    left_join(stability_raw, by="symbol") %>%
+    left_join(multi_return, by="symbol") %>%
+    mutate(
+      return_score=0.70 * multi_period_return_score + 0.30 * annual_return_score,
+      risk_score=0.35 * volatility_score + 0.35 * drawdown_score + 0.30 * cvar_score,
+      composite_score=0.40 * stability_score + 0.25 * return_score + 0.20 * risk_score + 0.15 * sharpe_score
+    )
+}
+
+# 將長表資料轉為日期 × 股票的日對數報酬矩陣。
+return_wide_matrix <- function(x, symbols = NULL) {
+  if (!is.null(symbols)) x <- x %>% filter(symbol %in% symbols)
+  wide <- x %>%
+    filter(is.finite(log_return)) %>%
+    select(date, symbol, log_return) %>%
+    distinct(date, symbol, .keep_all=TRUE) %>%
+    pivot_wider(names_from=symbol, values_from=log_return) %>%
+    arrange(date)
+  if (nrow(wide) == 0 || ncol(wide) < 3) return(NULL)
+  m <- as.matrix(wide[, -1, drop=FALSE])
+  storage.mode(m) <- "double"
+  m
+}
+
 # ============================================================
 # 4. 資料整理函數
 # ============================================================
@@ -743,9 +891,9 @@ portfolio_default_start_date <- max(
 # 共用顏色
 # ============================================================
 
-UP_COLOR <- "#C23B33"
-DOWN_COLOR <- "#39FF14"
-NEUTRAL_COLOR <- "#777777"
+UP_COLOR <- "#dc2626"
+DOWN_COLOR <- "#16a34a"
+NEUTRAL_COLOR <- "#64748b"
 
 # ============================================================
 # 代表色系統
@@ -761,7 +909,7 @@ other_stock_symbols <-
   )
 
 stock_colors <- c(
-  "0050" = "red"
+  "0050" = "#dc2626"
 )
 
 if (
@@ -877,133 +1025,102 @@ ui <- fluidPage(
       HTML(
         
         "
+        :root {
+          --navy:#0b1f3a;
+          --blue:#2563eb;
+          --blue2:#0ea5e9;
+          --purple:#7c3aed;
+          --green:#16a34a;
+          --amber:#f59e0b;
+          --red:#dc2626;
+          --ink:#1f2937;
+          --muted:#64748b;
+          --bg:#f3f6fb;
+          --card:#ffffff;
+          --line:#dbe4ef;
+        }
+
         body {
-          background:#f5f7fa;
-          color:#263238;
-          font-family:
-            -apple-system,
-            BlinkMacSystemFont,
-            'Segoe UI',
-            'Microsoft JhengHei',
-            sans-serif;
+          background:linear-gradient(180deg,#eef4ff 0,#f7f9fc 260px,#f3f6fb 100%);
+          color:var(--ink);
+          font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft JhengHei',sans-serif;
         }
 
-        .container-fluid {
-          padding:24px 30px 35px 30px;
-        }
+        .container-fluid { padding:22px 32px 42px 32px; max-width:1600px; }
 
-        .dashboard-title {
-          font-size:30px;
-          font-weight:700;
-          margin-bottom:4px;
+        .hero {
+          background:linear-gradient(120deg,#0b1f3a 0%,#163b72 58%,#2563eb 100%);
+          color:white;
+          border-radius:20px;
+          padding:26px 30px;
+          margin-bottom:18px;
+          box-shadow:0 12px 30px rgba(15,42,84,.18);
         }
-
-        .dashboard-subtitle {
-          color:#607d8b;
-          margin-bottom:20px;
-        }
+        .dashboard-title { font-size:32px; font-weight:800; letter-spacing:.3px; margin-bottom:6px; }
+        .dashboard-subtitle { color:#dbeafe; margin-bottom:0; font-size:16px; line-height:1.7; }
+        .hero-badge { display:inline-block; margin-top:12px; padding:6px 11px; border-radius:999px; background:rgba(255,255,255,.14); font-size:13px; }
 
         .nav-tabs {
-          margin-bottom:20px;
+          margin-bottom:22px; border-bottom:0; background:white; padding:8px;
+          border-radius:14px; box-shadow:0 5px 18px rgba(30,58,95,.08);
         }
-
-        .nav-tabs > li > a {
-          font-weight:600;
-          color:#455a64;
+        .nav-tabs > li > a { font-weight:700; color:#475569; border:0!important; border-radius:10px; margin:2px; }
+        .nav-tabs > li > a:hover { background:#eff6ff; color:#1d4ed8; }
+        .nav-tabs > li.active > a, .nav-tabs > li.active > a:hover, .nav-tabs > li.active > a:focus {
+          background:linear-gradient(120deg,#2563eb,#0ea5e9); color:white; border:0!important;
+          box-shadow:0 5px 12px rgba(37,99,235,.25);
         }
 
         .section-box {
-          background:#ffffff;
-          border:1px solid #e0e6eb;
-          border-radius:12px;
-          padding:24px;
-          margin-bottom:20px;
+          background:rgba(255,255,255,.97); border:1px solid var(--line); border-radius:18px;
+          padding:26px; margin-bottom:22px; box-shadow:0 8px 24px rgba(30,58,95,.07);
         }
-
-        .page-description {
-          color:#546e7a;
-          line-height:1.7;
-        }
+        .section-box h2 { font-weight:800; color:#102a4d; margin-top:0; }
+        .section-box h3 { font-weight:750; color:#173a66; margin-top:26px; }
+        .page-description { color:#52657a; line-height:1.8; font-size:15px; }
 
         .reading-guide {
-          background:#f1f7ff;
-          border-left:5px solid #1976d2;
-          padding:14px 18px;
-          border-radius:6px;
-          margin:15px 0 20px 0;
-          line-height:1.7;
+          background:linear-gradient(90deg,#edf6ff,#f5f3ff); border-left:5px solid #2563eb;
+          padding:15px 18px; border-radius:10px; margin:15px 0 20px; line-height:1.75;
         }
-
         .plot-explanation {
-          background:#fafafa;
-          border:1px solid #e3e7eb;
-          border-radius:8px;
-          padding:13px 16px;
-          margin:10px 0 20px 0;
-          line-height:1.7;
-          color:#455a64;
+          background:#f8fafc; border:1px solid #e2e8f0; border-left:4px solid #7c3aed;
+          border-radius:10px; padding:13px 16px; margin:10px 0 20px; line-height:1.75; color:#475569;
+        }
+        .method-note {
+          background:#fff7ed; border:1px solid #fed7aa; border-left:4px solid #f59e0b;
+          border-radius:10px; padding:14px 16px; margin:12px 0 18px; line-height:1.75;
         }
 
         .info-card {
-          background:#ffffff;
-          border:1px solid #e0e6eb;
-          border-radius:10px;
-          padding:15px;
-          min-height:105px;
-          margin-bottom:15px;
+          background:linear-gradient(145deg,#ffffff,#f8fbff); border:1px solid #dce6f1;
+          border-radius:15px; padding:17px 18px; min-height:112px; margin-bottom:15px;
+          box-shadow:0 5px 15px rgba(30,58,95,.07); transition:transform .15s ease, box-shadow .15s ease;
         }
+        .info-card:hover { transform:translateY(-2px); box-shadow:0 8px 18px rgba(30,58,95,.11); }
+        .info-card-title { color:#64748b; font-size:13px; font-weight:700; margin-bottom:8px; }
+        .info-card-value { font-size:25px; font-weight:800; color:#12355b; }
+        .accent-blue { border-top:4px solid #2563eb; }
+        .accent-purple { border-top:4px solid #7c3aed; }
+        .accent-green { border-top:4px solid #16a34a; }
+        .accent-amber { border-top:4px solid #f59e0b; }
+        .accent-red { border-top:4px solid #dc2626; }
 
-        .info-card-title {
-          color:#607d8b;
-          font-size:14px;
-          margin-bottom:8px;
-        }
+        .data-status { background:#f8fbff; border:1px solid #dce6f1; border-radius:12px; padding:16px; line-height:1.85; }
+        .warning-note { background:#fff8e1; border-left:5px solid #f59e0b; padding:13px 16px; border-radius:8px; margin:10px 0; line-height:1.7; }
+        .quick-button-row { margin:10px 0 15px; }
+        .quick-button-row .btn { margin-right:6px; margin-bottom:6px; border-radius:9px; }
+        .btn-primary, .action-button.btn-default { border-radius:9px; }
 
-        .info-card-value {
-          font-size:24px;
-          font-weight:700;
-        }
+        table { background:white; }
+        .table > thead > tr > th { background:#eaf2ff; color:#173a66; border-bottom:2px solid #bfd3ee; }
+        .table-striped > tbody > tr:nth-of-type(odd) { background:#f8fbff; }
 
-        .data-status {
-          background:#f8fafc;
-          border:1px solid #dde5eb;
-          border-radius:8px;
-          padding:15px;
-          line-height:1.8;
-        }
+        details.method-details { background:#f8fafc; border:1px solid #dbe4ef; border-radius:12px; padding:12px 16px; margin:10px 0; }
+        details.method-details summary { cursor:pointer; font-weight:750; color:#1d4ed8; }
+        .term-chip { display:inline-block; padding:5px 9px; margin:3px; background:#eef2ff; color:#4338ca; border-radius:999px; font-size:12px; font-weight:700; }
 
-        .warning-note {
-          background:#fff8e1;
-          border-left:5px solid #f9a825;
-          padding:13px 16px;
-          border-radius:6px;
-          margin:10px 0;
-          line-height:1.7;
-        }
-
-        .quick-button-row {
-          margin:10px 0 15px 0;
-        }
-
-        .quick-button-row .btn {
-          margin-right:5px;
-          margin-bottom:6px;
-        }
-
-        .portfolio-trade-box {
-          background:#f8fafc;
-          border:1px solid #e1e7eb;
-          border-radius:10px;
-          padding:18px;
-          margin-bottom:15px;
-        }
-
-        .dashboard-footer {
-          text-align:center;
-          color:#90a4ae;
-          font-size:13px;
-          padding-top:20px;
-        }
+        .dashboard-footer { text-align:center; color:#8392a5; font-size:13px; padding-top:22px; }
         "
         
       )
@@ -1012,13 +1129,13 @@ ui <- fluidPage(
   
   
   div(
-    class = "dashboard-title",
-    "0050 投資研究 Dashboard"
-  ),
-  
-  div(
-    class = "dashboard-subtitle",
-    "以日對數報酬、風險、穩定性與統計方法分析 0050 及其成分股"
+    class = "hero",
+    div(class = "dashboard-title", "0050 投資研究 Dashboard"),
+    div(
+      class = "dashboard-subtitle",
+      "以日對數報酬為統計基礎，從報酬、風險、穩定性、不確定性與歷史驗證分析 0050 及其成分股。"
+    ),
+    span(class = "hero-badge", "統計研究｜非投資建議｜資料每日更新")
   ),
   
   
@@ -1197,7 +1314,7 @@ ui <- fluidPage(
           column(
             3,
             div(
-              class = "info-card",
+              class = "info-card accent-blue",
               div(class = "info-card-title", "0050 綜合分數"),
               h3(class = "info-card-value", textOutput("market_0050_composite_score", inline = TRUE))
             )
@@ -1205,7 +1322,7 @@ ui <- fluidPage(
           column(
             3,
             div(
-              class = "info-card",
+              class = "info-card accent-purple",
               div(class = "info-card-title", "0050 穩定性分數"),
               h3(class = "info-card-value", textOutput("market_0050_stability_score", inline = TRUE))
             )
@@ -1213,7 +1330,7 @@ ui <- fluidPage(
           column(
             3,
             div(
-              class = "info-card",
+              class = "info-card accent-amber",
               div(class = "info-card-title", "0050 年化波動度"),
               h3(class = "info-card-value", textOutput("market_0050_volatility", inline = TRUE))
             )
@@ -1221,11 +1338,25 @@ ui <- fluidPage(
           column(
             3,
             div(
-              class = "info-card",
+              class = "info-card accent-red",
               div(class = "info-card-title", "0050 最大回撤"),
               h3(class = "info-card-value", textOutput("market_0050_max_drawdown", inline = TRUE))
             )
           )
+        ),
+        
+        h3("0050 近期市場狀態"),
+        
+        fluidRow(
+          column(4, div(class = "info-card accent-blue", div(class = "info-card-title", "均線趨勢"), h3(class = "info-card-value", textOutput("market_0050_trend", inline = TRUE)))),
+          column(4, div(class = "info-card accent-purple", div(class = "info-card-title", "14 日相對強弱指標（RSI）"), h3(class = "info-card-value", textOutput("market_0050_rsi", inline = TRUE)))),
+          column(4, div(class = "info-card accent-amber", div(class = "info-card-title", "近期波動狀態"), h3(class = "info-card-value", textOutput("market_0050_vol_state", inline = TRUE))))
+        ),
+        
+        div(
+          class = "plot-explanation",
+          strong("怎麼看？ "),
+          "技術狀態只用來描述近期趨勢與動能，不產生買進或賣出建議。排名與統計分析仍以日對數報酬、風險與穩定性為主。"
         ),
         
         hr(),
@@ -1860,198 +1991,163 @@ ui <- fluidPage(
     
     
     # ========================================================
-    # 9. 投資組合分析
+    # 9. 不確定性分析：區塊拔靴法
     # ========================================================
     
     tabPanel(
-      
-      "投資組合分析",
-      
+      "不確定性分析",
       div(
         class = "section-box",
-        
-        h2("投資組合模擬"),
-        
+        h2("不確定性分析｜區塊拔靴法"),
         p(
           class = "page-description",
-          "最多選擇 5 檔股票，設定買入、賣出日期與投入方式，模擬交易成本與投資績效。"
+          "排名告訴我們誰的分數較高；這一頁進一步檢查：某檔成分股相對 0050 的分數優勢，是否在重新抽樣後仍然成立。"
         ),
-        
         div(
           class = "reading-guide",
-          strong("怎麼使用？ "),
-          "先選股票，再設定每檔股票的交易日期與投入方式。系統會依調整後價格計算交易與每日資產價值。"
+          strong("為什麼不是普通拔靴法？ "),
+          "金融報酬可能具有時間相依與波動群聚，因此以連續數日為一個區塊共同抽樣；而且抽樣的是日對數報酬，不是股票價格。"
         ),
-        
-        selectizeInput(
-          "portfolio_stock",
-          "投資組合股票（最多 5 檔）：",
-          choices = dashboard_stock_choices,
-          selected = "0050",
-          multiple = TRUE,
-          options = list(
-            maxItems = MAX_SELECTED_STOCKS,
-            plugins = list("remove_button")
-          )
-        ),
-        
-        selectInput(
-          "portfolio_trade_mode",
-          "交易設定方式：",
-          choices = c(
-            "以投入金額設定",
-            "以持有股數設定"
-          ),
-          selected = "以投入金額設定"
-        ),
-        
-        uiOutput(
-          "portfolio_trade_inputs"
-        ),
-        
-        hr(),
-        
-        h3("交易成本設定"),
-        
         fluidRow(
-          
           column(
             3,
-            numericInput(
-              "brokerage_rate",
-              "手續費率（%）：",
-              value = 0.1425,
-              min = 0,
-              step = 0.01
+            selectInput(
+              "bootstrap_stock",
+              "比較成分股：",
+              choices = setNames(stock_info$symbol, paste0(stock_info$name, " (", stock_info$symbol, ")")),
+              selected = "2330"
             )
           ),
-          
           column(
             3,
-            numericInput(
-              "minimum_fee",
-              "最低手續費（元）：",
-              value = 20,
-              min = 0,
-              step = 1
+            selectInput(
+              "bootstrap_years",
+              "抽樣歷史期間：",
+              choices = c("近 3 年" = 3, "近 5 年" = 5, "全部可用期間" = 0),
+              selected = 3
             )
           ),
-          
           column(
             3,
-            numericInput(
-              "stock_tax_rate",
-              "股票證交稅（%）：",
-              value = 0.30,
-              min = 0,
-              step = 0.01
+            selectInput(
+              "bootstrap_block",
+              "區塊長度：",
+              choices = c("5 個交易日" = 5, "10 個交易日" = 10, "20 個交易日" = 20),
+              selected = 10
             )
           ),
-          
           column(
             3,
-            numericInput(
-              "etf_tax_rate",
-              "ETF 證交稅（%）：",
-              value = 0.10,
-              min = 0,
-              step = 0.01
+            selectInput(
+              "bootstrap_reps",
+              "重複抽樣次數：",
+              choices = c("300 次（較快）" = 300, "500 次" = 500, "1000 次（較完整）" = 1000),
+              selected = 500
             )
           )
         ),
-        
-        p(
-          class = "control-description",
-          "手續費於買進與賣出時計算；證交稅僅於賣出時計算。0050 使用 ETF 證交稅設定。"
-        ),
-        
-        hr(),
-        
-        h3("投資組合交易明細"),
-        
-        tableOutput(
-          "portfolio_trade_table"
-        ),
-        
-        hr(),
-        
-        h3("投資組合每日資產價值"),
-        
-        dateRangeInput(
-          "portfolio_value_date_range",
-          "圖表時間範圍：",
-          start = portfolio_default_start_date,
-          end = portfolio_default_end_date,
-          min = data_min_date,
-          max = data_max_date,
-          format = "yyyy-mm-dd",
-          separator = " 至 "
-        ),
-        
-        plotOutput(
-          "portfolio_value_chart",
-          height = "600px"
-        ),
-        
+        actionButton("run_bootstrap", "執行區塊拔靴法", class = "btn-primary"),
+        div(class = "method-note", "首次測試建議先選 300 或 500 次。正式報告若執行效率允許，再提高重複次數。固定亂數種子可讓同一份資料得到可重現結果。"),
+        h3("結果摘要"),
+        tableOutput("bootstrap_summary_table"),
+        h3("相對 0050 的綜合分數差異分布"),
+        plotOutput("bootstrap_diff_chart", height = "500px"),
         div(
           class = "plot-explanation",
           strong("怎麼看？ "),
-          "曲線上升表示投資組合資產價值增加；資產價值包含現金與尚未賣出的股票持倉。"
-        ),
-        
-        h3("投資組合績效摘要"),
-        
-        tableOutput(
-          "portfolio_summary"
-        ),
-        
-        h3("投資組合績效與風險指標"),
-        
-        tableOutput(
-          "portfolio_performance_metrics"
-        ),
-        
-        h3("投資組合與 0050 績效比較"),
-        
-        tableOutput(
-          "portfolio_benchmark_summary"
-        ),
-        
-        plotOutput(
-          "portfolio_benchmark_chart",
-          height = "550px"
-        ),
-        
-        div(
-          class = "plot-explanation",
-          strong("怎麼看？ "),
-          "紅色虛線為 0050，另一條線為投資組合；兩者由相同基準點開始比較。"
+          "橫軸是『成分股綜合分數－0050 綜合分數』。若 95% 區間大多位於 0 以上，代表相對優勢較穩定；若區間跨過 0，代表目前觀察到的差異仍具有明顯不確定性。"
         )
       )
     ),
     
     
     # ========================================================
-    # 10. 資料明細
+    # 10. 歷史回測：排名模型驗證
     # ========================================================
     
     tabPanel(
-      
-      "資料明細",
-      
+      "歷史回測",
       div(
         class = "section-box",
-        
-        h2("資料明細"),
-        
+        h2("歷史回測｜排名模型驗證"),
         p(
           class = "page-description",
-          "查看目前 Dashboard 使用的股票清單、產業分類與資料範圍。"
+          "這裡不是讓使用者事後挑買賣日期，而是模擬『當時只能看到過去資料』的情況，檢查綜合排名對下一年度是否具有區辨能力。"
         ),
-        
-        tableOutput(
-          "stock_table"
-        )
+        div(
+          class = "reading-guide",
+          strong("回測流程： "),
+          "每年年底只使用當時以前的資料計算分數與排名，再觀察下一年度 Top 5、Top 10、Bottom 10 與 0050 的實際表現。"
+        ),
+        fluidRow(
+          column(4, selectInput("backtest_lookback", "排名使用歷史長度：", choices=c("近 3 年"=3, "近 5 年"=5), selected=3)),
+          column(4, numericInput("backtest_start_year", "最早排名年度：", value=2019, min=2018, max=max(2019, as.integer(format(data_max_date, "%Y")) - 1), step=1)),
+          column(4, actionButton("run_backtest", "執行歷史回測", class="btn-primary"))
+        ),
+        div(
+          class = "warning-note",
+          strong("研究限制： "),
+          "目前成分股清單以現有研究名單為基礎，因此早期年份可能存在存活者偏差。這一版回測主要驗證排名模型邏輯，正式報告需將此限制明確揭露；若後續取得歷年成分股異動資料，可再升級為歷史成分股回測。"
+        ),
+        h3("累積回測結果"),
+        plotOutput("backtest_cumulative_chart", height="520px"),
+        h3("模型驗證摘要"),
+        tableOutput("backtest_summary_table"),
+        h3("逐年結果"),
+        tableOutput("backtest_yearly_table"),
+        div(class="plot-explanation", strong("怎麼看？ "), "重點不是挑出一條最漂亮的策略，而是觀察高排名組與低排名組在不同年度是否呈現可重複的差異，以及 Top 組合勝過 0050 的年度比例。")
+      )
+    ),
+    
+    
+    # ========================================================
+    # 11. 研究方法與資料說明
+    # ========================================================
+    
+    tabPanel(
+      "研究方法與說明",
+      div(
+        class = "section-box",
+        h2("研究方法、指標與資料說明"),
+        p(class="page-description", "這一頁集中說明網站怎麼算、專有名詞代表什麼，以及各結果應該如何解讀。"),
+        div(class="reading-guide", strong("核心原則： "), "價格用來觀察走勢；日對數報酬率用來進行主要統計分析。網站結果為統計研究與歷史資料分析，不構成投資建議。"),
+        tags$details(class="method-details", open=NA,
+          tags$summary("日對數報酬率：是什麼、怎麼算、怎麼看？"),
+          p("定義：相鄰兩個交易日價格變化的對數形式。"),
+          p("計算：ln(今日調整後價格 / 昨日調整後價格)。"),
+          p("解讀：正值代表上漲、負值代表下跌；本研究的波動、相關性、條件風險值、主成分與拔靴法主要都從這個報酬序列出發。")
+        ),
+        tags$details(class="method-details",
+          tags$summary("年化波動度、最大回撤與條件風險值"),
+          p("年化波動度：衡量日對數報酬的典型波動程度，數值越高通常代表價格起伏較大。"),
+          p("最大回撤：衡量研究期間中，資產從先前高點到後續低點曾出現的最深跌幅。"),
+          p("95% 條件風險值：觀察最差約 5% 日對數報酬的平均損失，用來補充一般波動度不易描述的尾端風險。")
+        ),
+        tags$details(class="method-details",
+          tags$summary("夏普比率、穩定性分數與綜合分數"),
+          p("夏普比率：衡量每承擔一單位波動風險，得到多少風險調整後報酬；本版本以研究資料中的平均日對數報酬與年化波動度計算。"),
+          p("穩定性分數：同時觀察 1 週、1 個月、3 個月、6 個月與 1 年的報酬、相對排名與風險是否一致。"),
+          p("綜合分數：目前基準權重為穩定性 40%、報酬 25%、風險 20%、夏普比率 15%。0050 有自己的分數，但不參與成分股名次。")
+        ),
+        tags$details(class="method-details",
+          tags$summary("區塊拔靴法"),
+          p("做法：將連續多日的日對數報酬視為一個區塊，反覆重新抽樣，建立綜合分數差異的經驗分布。"),
+          p("目的：排名本身告訴我們誰較高；拔靴法則告訴我們這個差異是否容易因樣本變動而改變。")
+        ),
+        tags$details(class="method-details",
+          tags$summary("歷史回測"),
+          p("做法：每個排名時點只使用當時以前可以看到的資料，再觀察下一年度表現，以避免前視偏誤。"),
+          p("目的：驗證排名模型是否具有歷史區辨能力，而不是讓使用者事後挑選最漂亮的買賣日期。")
+        ),
+        tags$details(class="method-details",
+          tags$summary("主成分分析與分群"),
+          p("主成分分析：將多個可能重疊的指標整理成少數主要資訊方向，用來檢查資料結構與指標重複程度。"),
+          p("分群：依統計特徵將成分股分成相似群組，用來解釋股票型態，不直接決定綜合排名。")
+        ),
+        h3("目前資料清單與有效期間"),
+        tableOutput("stock_table"),
+        h3("研究限制"),
+        div(class="warning-note", "0050 成分股會隨時間調整；若以目前成分股回溯過去，可能產生存活者偏差。此外，所有統計結果都會受到研究期間、資料品質與市場狀態影響。")
       )
     )
   ),
@@ -2059,7 +2155,7 @@ ui <- fluidPage(
   
   div(
     class = "dashboard-footer",
-    "0050 投資研究 Dashboard"
+    "0050 投資研究 Dashboard｜統計研究用途・非投資建議"
   )
 )
 
@@ -2743,8 +2839,8 @@ server <- function(input, output, session) {
         ) +
           
           geom_line(
-            color = "black",
-            linewidth = 0.85
+            color = stock_colors["0050"],
+            linewidth = 1.0
           ) +
           
           labs(
@@ -2909,8 +3005,8 @@ server <- function(input, output, session) {
           ) +
           
           geom_line(
-            color = "black",
-            linewidth = 0.7
+            color = stock_colors["0050"],
+            linewidth = 0.8
           ) +
           
           labs(
@@ -3723,6 +3819,40 @@ server <- function(input, output, session) {
           )
       )
     
+  })
+  
+
+  # ----------------------------------------------------------
+  # 累積報酬（補回舊版 UI 原本缺少的 Server 輸出）
+  # ----------------------------------------------------------
+  
+  output$cumulative_return_display <- renderUI({
+    req(length(analysis_symbols()) > 0)
+    plotOutput("cumulative_return_plot", height = "500px")
+  })
+  
+  output$cumulative_return_plot <- renderPlot({
+    symbols <- analysis_symbols()
+    x <- analysis_data() %>%
+      filter(symbol %in% symbols, is.finite(log_return)) %>%
+      group_by(symbol) %>%
+      arrange(date, .by_group = TRUE) %>%
+      mutate(cumulative_return = exp(cumsum(log_return)) - 1) %>%
+      ungroup()
+    req(nrow(x) > 0)
+    ggplot(x, aes(x=date, y=cumulative_return, color=symbol, group=symbol)) +
+      geom_hline(yintercept=0, linetype="dashed", color="#94a3b8") +
+      geom_line(linewidth=1.0) +
+      scale_color_manual(
+        values=stock_colors[symbols],
+        breaks=symbols,
+        labels=setNames(get_stock_label(symbols), symbols),
+        drop=FALSE
+      ) +
+      scale_y_continuous(labels=function(z) paste0(round(z*100,1), "%")) +
+      labs(title="期間累積報酬", x="日期", y="累積報酬率", color=NULL) +
+      theme_minimal() +
+      theme(plot.title=element_text(hjust=0.5, face="bold"), legend.position="bottom")
   })
   
   # ----------------------------------------------------------
@@ -4839,6 +4969,32 @@ server <- function(input, output, session) {
     fmt_pct(x$max_drawdown, 2, TRUE)
   })
   
+  output$market_0050_trend <- renderText({
+    x <- data() %>% filter(symbol == "0050", is.finite(adjusted)) %>% arrange(date)
+    req(nrow(x) >= 60)
+    p <- tail(x$adjusted, 1)
+    ma20 <- mean(tail(x$adjusted, 20), na.rm=TRUE)
+    ma60 <- mean(tail(x$adjusted, 60), na.rm=TRUE)
+    if (p > ma20 && ma20 > ma60) "偏強" else if (p < ma20 && ma20 < ma60) "偏弱" else "整理"
+  })
+  
+  output$market_0050_rsi <- renderText({
+    x <- data() %>% filter(symbol == "0050", is.finite(adjusted)) %>% arrange(date)
+    value <- rsi_value(x$adjusted, 14)
+    if (!is.finite(value)) return("NA")
+    state <- if (value >= 70) "動能偏熱" else if (value <= 30) "動能偏弱" else "中性"
+    paste0(sprintf("%.1f", value), "｜", state)
+  })
+  
+  output$market_0050_vol_state <- renderText({
+    x <- data() %>% filter(symbol == "0050", is.finite(log_return)) %>% arrange(date)
+    req(nrow(x) >= 63)
+    recent <- sd(tail(x$log_return, 21), na.rm=TRUE)
+    base <- sd(tail(x$log_return, min(252, nrow(x))), na.rm=TRUE)
+    ratio <- recent / base
+    if (!is.finite(ratio)) "NA" else if (ratio >= 1.20) "波動偏高" else if (ratio <= 0.80) "波動偏低" else "接近一年水準"
+  })
+  
   output$composite_ranking_chart <- renderPlot({
     x <- research_metrics() %>%
       filter(symbol %in% stock_info$symbol, is.finite(composite_score)) %>%
@@ -4846,8 +5002,9 @@ server <- function(input, output, session) {
       slice_head(n = 10) %>%
       mutate(label = paste0(symbol, " ", name))
     req(nrow(x) > 0)
-    ggplot(x, aes(x = composite_score, y = reorder(label, composite_score))) +
-      geom_col() +
+    ggplot(x, aes(x = composite_score, y = reorder(label, composite_score), fill = symbol)) +
+      geom_col(width = 0.72) +
+      scale_fill_manual(values = stock_colors, guide = "none") +
       geom_vline(
         xintercept = research_metrics() %>% filter(symbol == "0050") %>% pull(composite_score),
         linetype = "dashed"
@@ -4891,8 +5048,9 @@ server <- function(input, output, session) {
       slice_head(n = 10) %>%
       mutate(label = paste0(symbol, " ", name))
     req(nrow(x) > 0)
-    ggplot(x, aes(x = stability_score, y = reorder(label, stability_score))) +
-      geom_col() +
+    ggplot(x, aes(x = stability_score, y = reorder(label, stability_score), fill = symbol)) +
+      geom_col(width = 0.72) +
+      scale_fill_manual(values = stock_colors, guide = "none") +
       labs(
         title = "成分股穩定性分數前 10 名",
         x = "穩定性分數（0–100）",
@@ -4991,6 +5149,185 @@ server <- function(input, output, session) {
     x
   }, striped = TRUE, bordered = TRUE, hover = TRUE)
   
+  
+
+  # ==========================================================
+  # 6-1. 不確定性分析：區塊拔靴法
+  # ==========================================================
+  
+  bootstrap_result <- eventReactive(input$run_bootstrap, {
+    req(input$bootstrap_stock)
+    set.seed(20261023)
+    years <- as.integer(input$bootstrap_years)
+    block_length <- as.integer(input$bootstrap_block)
+    reps <- as.integer(input$bootstrap_reps)
+    end_date <- latest_date()
+    start_date <- if (years > 0) end_date - round(365.25 * years) else earliest_date()
+    x <- data() %>%
+      filter(date >= start_date, date <= end_date, symbol %in% dashboard_symbols, is.finite(log_return))
+    m <- return_wide_matrix(x, dashboard_symbols)
+    req(!is.null(m), nrow(m) >= 126, "0050" %in% colnames(m), input$bootstrap_stock %in% colnames(m))
+    diffs <- rep(NA_real_, reps)
+    for (b in seq_len(reps)) {
+      idx <- block_bootstrap_indices(nrow(m), block_length)
+      s <- score_return_matrix(m[idx, , drop=FALSE])
+      if (nrow(s) == 0) next
+      stock_score <- s$composite_score[s$symbol == input$bootstrap_stock]
+      bench_score <- s$composite_score[s$symbol == "0050"]
+      if (length(stock_score) == 1 && length(bench_score) == 1 && is.finite(stock_score) && is.finite(bench_score)) {
+        diffs[b] <- stock_score - bench_score
+      }
+    }
+    diffs <- diffs[is.finite(diffs)]
+    req(length(diffs) >= max(50, reps * 0.5))
+    ci <- as.numeric(quantile(diffs, c(0.025, 0.975), na.rm=TRUE, names=FALSE))
+    prob_above <- mean(diffs > 0, na.rm=TRUE)
+    label <- if (ci[1] > 0) "相對優勢較穩定" else if (ci[2] < 0) "相對 0050 較弱且結果穩定" else "與 0050 的差異仍具不確定性"
+    list(
+      diffs=diffs,
+      ci=ci,
+      prob_above=prob_above,
+      label=label,
+      reps=length(diffs),
+      stock=input$bootstrap_stock,
+      years=years,
+      block=block_length
+    )
+  }, ignoreInit=TRUE)
+  
+  output$bootstrap_summary_table <- renderTable({
+    r <- bootstrap_result()
+    data.frame(
+      比較標的=get_stock_label(r$stock),
+      有效重複次數=r$reps,
+      區塊長度=paste0(r$block, " 個交易日"),
+      平均分數差=sprintf("%+.2f", mean(r$diffs)),
+      `95%區間下限`=sprintf("%+.2f", r$ci[1]),
+      `95%區間上限`=sprintf("%+.2f", r$ci[2]),
+      `高於0050比例`=paste0(round(r$prob_above * 100, 1), "%"),
+      結論=r$label,
+      check.names=FALSE,
+      stringsAsFactors=FALSE
+    )
+  }, striped=TRUE, bordered=TRUE, hover=TRUE)
+  
+  output$bootstrap_diff_chart <- renderPlot({
+    r <- bootstrap_result()
+    x <- data.frame(diff=r$diffs)
+    ggplot(x, aes(x=diff)) +
+      geom_histogram(aes(y=after_stat(density)), bins=36, fill="#7c3aed", color="white", alpha=0.85) +
+      geom_density(color="#2563eb", linewidth=1.1) +
+      geom_vline(xintercept=0, linetype="dashed", color="#dc2626", linewidth=1) +
+      geom_vline(xintercept=r$ci, linetype="dotted", color="#f59e0b", linewidth=1) +
+      labs(
+        title=paste0(get_stock_label(r$stock), " 相對 0050 的區塊拔靴分布"),
+        subtitle=paste0("95% 區間：", sprintf("%+.2f", r$ci[1]), " ～ ", sprintf("%+.2f", r$ci[2])),
+        x="綜合分數差（成分股－0050）",
+        y="密度"
+      ) +
+      theme_minimal() +
+      theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5))
+  })
+  
+  # ==========================================================
+  # 6-2. 歷史回測：排名模型驗證
+  # ==========================================================
+  
+  backtest_result <- eventReactive(input$run_backtest, {
+    lookback <- as.integer(input$backtest_lookback)
+    start_year <- as.integer(input$backtest_start_year)
+    max_score_year <- as.integer(format(latest_date(), "%Y")) - 1
+    years <- seq(max(start_year, as.integer(format(earliest_date(), "%Y")) + lookback), max_score_year)
+    req(length(years) >= 2)
+    yearly <- lapply(years, function(y) {
+      cutoff <- as.Date(paste0(y, "-12-31"))
+      hist_start <- as.Date(paste0(y - lookback + 1, "-01-01"))
+      hist <- data() %>% filter(date >= hist_start, date <= cutoff, symbol %in% dashboard_symbols, is.finite(log_return))
+      m <- return_wide_matrix(hist, dashboard_symbols)
+      if (is.null(m) || nrow(m) < 252) return(NULL)
+      scores <- score_return_matrix(m) %>% filter(symbol %in% stock_info$symbol, is.finite(composite_score)) %>% arrange(desc(composite_score))
+      if (nrow(scores) < 15) return(NULL)
+      top5 <- head(scores$symbol, 5)
+      top10 <- head(scores$symbol, min(10, nrow(scores)))
+      bottom10 <- tail(scores$symbol, min(10, nrow(scores)))
+      next_start <- as.Date(paste0(y + 1, "-01-01"))
+      next_end <- as.Date(paste0(y + 1, "-12-31"))
+      fut <- data() %>% filter(date >= next_start, date <= next_end, symbol %in% c("0050", top5, top10, bottom10), is.finite(log_return))
+      stock_returns <- fut %>% group_by(symbol) %>% summarise(ret=exp(sum(log_return, na.rm=TRUE))-1, n=n(), .groups="drop")
+      strategy_ret <- function(symbols) {
+        z <- stock_returns %>% filter(symbol %in% symbols, n >= 100, is.finite(ret))
+        if (nrow(z) == 0) return(NA_real_)
+        mean(z$ret, na.rm=TRUE)
+      }
+      bench <- stock_returns$ret[stock_returns$symbol == "0050"]
+      data.frame(
+        排名年度=y,
+        評估年度=y+1,
+        Top5=strategy_ret(top5),
+        Top10=strategy_ret(top10),
+        Bottom10=strategy_ret(bottom10),
+        `0050`=ifelse(length(bench)==1, bench, NA_real_),
+        stringsAsFactors=FALSE,
+        check.names=FALSE
+      )
+    }) %>% bind_rows()
+    req(nrow(yearly) >= 2)
+    long <- yearly %>%
+      pivot_longer(cols=c(Top5, Top10, Bottom10, `0050`), names_to="策略", values_to="年度報酬") %>%
+      filter(is.finite(年度報酬)) %>%
+      group_by(策略) %>%
+      arrange(評估年度, .by_group=TRUE) %>%
+      mutate(累積報酬=cumprod(1 + 年度報酬) - 1) %>%
+      ungroup()
+    bench_by_year <- yearly %>% select(評估年度, benchmark=`0050`)
+    summary <- long %>%
+      left_join(bench_by_year, by="評估年度") %>%
+      group_by(策略) %>%
+      summarise(
+        回測年度數=n(),
+        累積報酬=prod(1 + 年度報酬, na.rm=TRUE) - 1,
+        平均年度報酬=mean(年度報酬, na.rm=TRUE),
+        年度報酬標準差=sd(年度報酬, na.rm=TRUE),
+        最差年度=min(年度報酬, na.rm=TRUE),
+        勝過0050比例=ifelse(策略 == "0050", NA_real_, mean(年度報酬 > benchmark, na.rm=TRUE)),
+        .groups="drop"
+      )
+    list(yearly=yearly, long=long, summary=summary)
+  }, ignoreInit=TRUE)
+  
+  output$backtest_cumulative_chart <- renderPlot({
+    r <- backtest_result()
+    ggplot(r$long, aes(x=評估年度, y=累積報酬, color=策略, group=策略)) +
+      geom_hline(yintercept=0, linetype="dashed", color="#94a3b8") +
+      geom_line(linewidth=1.15) +
+      geom_point(size=2.3) +
+      scale_color_manual(values=c("Top5"="#2563eb", "Top10"="#7c3aed", "Bottom10"="#f59e0b", "0050"="#dc2626")) +
+      scale_y_continuous(labels=function(z) paste0(round(z*100,1), "%")) +
+      labs(title="排名模型歷史回測：累積表現", x="評估年度", y="累積報酬", color="比較組別") +
+      theme_minimal() +
+      theme(plot.title=element_text(hjust=0.5, face="bold"), legend.position="bottom")
+  })
+  
+  output$backtest_summary_table <- renderTable({
+    r <- backtest_result()
+    r$summary %>% mutate(
+      累積報酬=fmt_pct(累積報酬,2,TRUE),
+      平均年度報酬=fmt_pct(平均年度報酬,2,TRUE),
+      年度報酬標準差=fmt_pct(年度報酬標準差,2,FALSE),
+      最差年度=fmt_pct(最差年度,2,TRUE),
+      勝過0050比例=ifelse(is.finite(勝過0050比例), paste0(round(勝過0050比例*100,1), "%"), "—")
+    )
+  }, striped=TRUE, bordered=TRUE, hover=TRUE)
+  
+  output$backtest_yearly_table <- renderTable({
+    r <- backtest_result()
+    r$yearly %>% mutate(
+      Top5=fmt_pct(Top5,2,TRUE),
+      Top10=fmt_pct(Top10,2,TRUE),
+      Bottom10=fmt_pct(Bottom10,2,TRUE),
+      `0050`=fmt_pct(`0050`,2,TRUE)
+    )
+  }, striped=TRUE, bordered=TRUE, hover=TRUE)
   
   # ==========================================================
   # 7. 產業比較
