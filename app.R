@@ -1,4 +1,4 @@
-# 0050 投資研究 Dashboard v3：淺色介面＋模型驗證＋效能收斂＋親民註解
+# 0050 投資研究 Dashboard v4：統一時間尺度＋滾動評分＋PCA分群透明化＋彈性模型驗證
 # Connect Cloud auto-publish test
 # ============================================================
 # 0050 Investment Research Dashboard
@@ -23,6 +23,60 @@ RESEARCH_END_DATE   <- Sys.Date()
 TRADING_DAYS_PER_YEAR <- 252
 MAX_SELECTED_STOCKS <- 5
 TRADE_UNIT <- 1
+
+# ============================================================
+# 統一時間尺度（全站共用）
+# ============================================================
+# 所有頁面盡量使用同一組名稱與交易日定義，避免「1季 / 3個月 / 90天」混用。
+TIME_WINDOWS <- c(
+  `1週` = 5,
+  `1個月` = 21,
+  `3個月` = 63,
+  `6個月` = 126,
+  `1年` = 252,
+  `3年` = 756
+)
+
+# 主評分的多期間報酬權重：近期要看得到，但不讓一週行情主導整體。
+RETURN_WINDOW_WEIGHTS <- c(
+  `1週` = 0.05,
+  `1個月` = 0.10,
+  `3個月` = 0.15,
+  `6個月` = 0.20,
+  `1年` = 0.30,
+  `3年` = 0.20
+)
+
+# 四大構面的主模型權重。先保留目前版本，再由歷史驗證做敏感度比較。
+MODEL_WEIGHTS <- c(stability = 0.40, ret = 0.25, risk = 0.20, sharpe = 0.15)
+WEIGHT_PROFILES <- list(
+  baseline = c(stability = 0.40, ret = 0.25, risk = 0.20, sharpe = 0.15),
+  balanced = c(stability = 0.35, ret = 0.30, risk = 0.20, sharpe = 0.15),
+  return_focus = c(stability = 0.30, ret = 0.35, risk = 0.20, sharpe = 0.15)
+)
+WEIGHT_PROFILE_LABELS <- c(
+  baseline = "目前版｜40 / 25 / 20 / 15",
+  balanced = "均衡版｜35 / 30 / 20 / 15",
+  return_focus = "報酬稍強版｜30 / 35 / 20 / 15"
+)
+
+# 風險 / 夏普的主要比較視窗。
+PRIMARY_RISK_WINDOW <- 252
+
+# PCA / 分群只提供樣本量較足夠的期間。
+PCA_WINDOWS <- c(`3個月` = 63, `6個月` = 126, `1年` = 252, `3年` = 756)
+
+# 模型驗證：評分後往前觀察多久。
+BACKTEST_HORIZONS <- c(
+  `1週` = 5,
+  `1個月` = 21,
+  `3個月` = 63,
+  `6個月` = 126,
+  `1年` = 252,
+  `2年` = 504,
+  `3年` = 756,
+  `5年` = 1260
+)
 
 
 # ============================================================
@@ -440,9 +494,42 @@ fmt_score <- function(x, digits = 1) {
   )
 }
 
+# 依「交易日數」取得共同分析起點。
+# 用整體市場交易日而不是每檔股票各自倒數，可讓股票之間比較期間一致。
+window_start_from_dates <- function(dates, n_days, end_date = NULL) {
+  dates <- sort(unique(as.Date(dates)))
+  if (!is.null(end_date)) dates <- dates[dates <= as.Date(end_date)]
+  if (length(dates) == 0) return(as.Date(NA))
+  n_days <- max(1, as.integer(n_days))
+  idx <- max(1, length(dates) - n_days + 1)
+  dates[idx]
+}
+
+window_label <- function(n_days) {
+  hit <- names(TIME_WINDOWS)[TIME_WINDOWS == as.integer(n_days)]
+  if (length(hit) > 0) return(hit[1])
+  hit <- names(BACKTEST_HORIZONS)[BACKTEST_HORIZONS == as.integer(n_days)]
+  if (length(hit) > 0) return(hit[1])
+  paste0(n_days, " 個交易日")
+}
+
+# 快速滾動標準差；用於 PCA 的「風險穩定度」特徵。
+rolling_sd_fast <- function(x, window = 21) {
+  x <- as.numeric(x)
+  ok <- is.finite(x)
+  roll_sum <- function(z) as.numeric(stats::filter(z, rep(1, window), sides = 1))
+  n_obs <- roll_sum(as.numeric(ok))
+  x0 <- ifelse(ok, x, 0)
+  sx <- roll_sum(x0)
+  sxx <- roll_sum(x0 * x0)
+  var_num <- (sxx - sx * sx / n_obs) / pmax(n_obs - 1, 1)
+  out <- sqrt(pmax(var_num, 0))
+  out[n_obs < window | !is.finite(out)] <- NA_real_
+  out
+}
 
 # ============================================================
-# 3-2. 技術狀態、區塊拔靴法與歷史回測共用函數（v2 新增）
+# 3-2. 技術狀態、區塊拔靴法與歷史回測共用函數（v4）
 # ============================================================
 
 # RSI（14 日）簡化計算：僅作為市場狀態輔助，不作買賣建議。
@@ -474,19 +561,27 @@ block_bootstrap_indices <- function(n, block_length = 10) {
 
 # 由「日期 × 股票」的日對數報酬矩陣計算研究分數。
 # 這個函數用於區塊拔靴法與歷史回測，計算邏輯與主排名保持同一方向。
-score_return_matrix <- function(return_matrix) {
+score_return_matrix <- function(return_matrix, model_weights = MODEL_WEIGHTS) {
   return_matrix <- as.matrix(return_matrix)
   if (nrow(return_matrix) < 63 || ncol(return_matrix) < 2) return(data.frame())
   symbols <- colnames(return_matrix)
   if (is.null(symbols)) symbols <- paste0("S", seq_len(ncol(return_matrix)))
-  period_days <- c(`1週` = 5, `1個月` = 21, `3個月` = 63, `6個月` = 126, `1年` = 252)
-  period_weights <- c(`1週` = 0.05, `1個月` = 0.10, `3個月` = 0.20, `6個月` = 0.25, `1年` = 0.40)
 
+  period_days <- TIME_WINDOWS
+  period_weights <- RETURN_WINDOW_WEIGHTS
+
+  # 風險、回撤、CVaR、Sharpe 固定用「最近 1 年」作主要比較視窗。
+  # 這樣不會因為某檔股票上市 10 年、另一檔只有 3 年而混用不同長度。
   base_rows <- lapply(seq_along(symbols), function(j) {
-    r <- return_matrix[, j]
-    r <- r[is.finite(r)]
-    if (length(r) < 63) {
-      return(data.frame(symbol=symbols[j], n_obs=length(r), annual_return=NA_real_, annual_volatility=NA_real_, max_drawdown=NA_real_, cvar_95=NA_real_, mean_daily_log=NA_real_, sharpe=NA_real_))
+    r_all <- return_matrix[, j]
+    r_window <- tail(r_all, min(PRIMARY_RISK_WINDOW, nrow(return_matrix)))
+    r <- r_window[is.finite(r_window)]
+    if (length(r) < floor(PRIMARY_RISK_WINDOW * 0.75)) {
+      return(data.frame(
+        symbol=symbols[j], n_obs=length(r), annual_return=NA_real_,
+        annual_volatility=NA_real_, max_drawdown=NA_real_, cvar_95=NA_real_,
+        mean_daily_log=NA_real_, sharpe=NA_real_
+      ))
     }
     wealth <- exp(cumsum(r))
     ann_vol <- sd(r, na.rm=TRUE) * sqrt(TRADING_DAYS_PER_YEAR)
@@ -499,7 +594,8 @@ score_return_matrix <- function(return_matrix) {
       max_drawdown=min(drawdown_value(wealth), na.rm=TRUE),
       cvar_95=cvar_value(r, 0.95),
       mean_daily_log=mean_daily,
-      sharpe=ifelse(is.finite(ann_vol) && ann_vol > 0, mean_daily * TRADING_DAYS_PER_YEAR / ann_vol, NA_real_),
+      sharpe=ifelse(is.finite(ann_vol) && ann_vol > 0,
+                    mean_daily * TRADING_DAYS_PER_YEAR / ann_vol, NA_real_),
       stringsAsFactors=FALSE
     )
   })
@@ -508,18 +604,25 @@ score_return_matrix <- function(return_matrix) {
   period_long <- bind_rows(lapply(names(period_days), function(period_name) {
     n_day <- period_days[[period_name]]
     rows <- lapply(seq_along(symbols), function(j) {
-      r <- return_matrix[, j]
-      r <- r[is.finite(r)]
-      if (length(r) < max(3, floor(n_day * 0.75))) {
-        return(data.frame(symbol=symbols[j], period=period_name, period_log_return=NA_real_, annualized_log_mean=NA_real_, annualized_volatility=NA_real_))
+      r_all <- return_matrix[, j]
+      rr_window <- tail(r_all, min(n_day, nrow(return_matrix)))
+      r <- rr_window[is.finite(rr_window)]
+      min_required <- max(3, floor(n_day * 0.75))
+      if (length(r) < min_required) {
+        return(data.frame(
+          symbol=symbols[j], period=period_name,
+          period_log_return=NA_real_, annualized_log_mean=NA_real_,
+          annualized_volatility=NA_real_
+        ))
       }
-      rr <- tail(r, min(n_day, length(r)))
+      rr <- r
       data.frame(
         symbol=symbols[j],
         period=period_name,
         period_log_return=sum(rr, na.rm=TRUE),
         annualized_log_mean=mean(rr, na.rm=TRUE) * TRADING_DAYS_PER_YEAR,
-        annualized_volatility=sd(rr, na.rm=TRUE) * sqrt(TRADING_DAYS_PER_YEAR),
+        annualized_volatility=ifelse(length(rr) >= 20,
+                                     sd(rr, na.rm=TRUE) * sqrt(TRADING_DAYS_PER_YEAR), NA_real_),
         stringsAsFactors=FALSE
       )
     })
@@ -529,30 +632,49 @@ score_return_matrix <- function(return_matrix) {
     mutate(return_percentile = cross_section_score(period_log_return, TRUE)) %>%
     ungroup()
 
-  stability_raw <- period_long %>%
+  # 報酬與排名穩定性：六個統一時間尺度一起看。
+  # 風險穩定性：1週與1月樣本太短，不納入；由3月、6月、1年、3年比較。
+  stability_rank_return <- period_long %>%
     group_by(symbol) %>%
     summarise(
       rank_variation=sd(return_percentile, na.rm=TRUE),
       return_variation=sd(annualized_log_mean, na.rm=TRUE),
-      risk_variation=sd(annualized_volatility, na.rm=TRUE),
       valid_periods=sum(is.finite(period_log_return)),
       .groups="drop"
-    ) %>%
+    )
+
+  stability_risk <- period_long %>%
+    filter(period %in% c("3個月", "6個月", "1年", "3年")) %>%
+    group_by(symbol) %>%
+    summarise(
+      risk_variation=sd(annualized_volatility, na.rm=TRUE),
+      valid_risk_periods=sum(is.finite(annualized_volatility)),
+      .groups="drop"
+    )
+
+  stability_raw <- stability_rank_return %>%
+    left_join(stability_risk, by="symbol") %>%
     mutate(
       rank_variation=ifelse(valid_periods >= 3, rank_variation, NA_real_),
       return_variation=ifelse(valid_periods >= 3, return_variation, NA_real_),
-      risk_variation=ifelse(valid_periods >= 3, risk_variation, NA_real_),
+      risk_variation=ifelse(valid_risk_periods >= 2, risk_variation, NA_real_),
       rank_stability_score=cross_section_score(rank_variation, FALSE),
       return_stability_score=cross_section_score(return_variation, FALSE),
       risk_stability_score=cross_section_score(risk_variation, FALSE),
-      stability_score=0.30 * rank_stability_score + 0.40 * return_stability_score + 0.30 * risk_stability_score
+      stability_score=0.30 * rank_stability_score +
+                      0.40 * return_stability_score +
+                      0.30 * risk_stability_score
     )
 
   multi_return <- period_long %>%
     mutate(weight=period_weights[period]) %>%
     group_by(symbol) %>%
     summarise(
-      multi_period_return_score=ifelse(sum(is.finite(return_percentile)) >= 3, weighted.mean(return_percentile, weight, na.rm=TRUE), NA_real_),
+      multi_period_return_score=ifelse(
+        sum(is.finite(return_percentile)) >= 3,
+        weighted.mean(return_percentile, weight, na.rm=TRUE),
+        NA_real_
+      ),
       .groups="drop"
     )
 
@@ -569,7 +691,10 @@ score_return_matrix <- function(return_matrix) {
     mutate(
       return_score=0.70 * multi_period_return_score + 0.30 * annual_return_score,
       risk_score=0.35 * volatility_score + 0.35 * drawdown_score + 0.30 * cvar_score,
-      composite_score=0.40 * stability_score + 0.25 * return_score + 0.20 * risk_score + 0.15 * sharpe_score
+      composite_score=model_weights[["stability"]] * stability_score +
+                      model_weights[["ret"]] * return_score +
+                      model_weights[["risk"]] * risk_score +
+                      model_weights[["sharpe"]] * sharpe_score
     )
 }
 
@@ -934,21 +1059,31 @@ other_stock_symbols <-
   )
 
 stock_colors <- c(
-  "0050" = "#5b8ecb"
+  "0050" = "#4f86c6"
 )
 
-if (
-  length(other_stock_symbols) > 0
-) {
-  
-  stock_colors[
-    other_stock_symbols
-  ] <-
-    hcl.colors(
-      length(other_stock_symbols),
-      palette = "Dynamic"
-    )
-  
+if (length(other_stock_symbols) > 0) {
+  # 刻意避開純紅 / 純綠，讓紅綠保留給台股漲跌語意。
+  # 色相分成藍紫、紫紅、橘金、青藍四區，並固定依股票代號順序配置。
+  n_stock_color <- length(other_stock_symbols)
+  hue_pool <- c(
+    seq(195, 255, length.out = 18),
+    seq(270, 330, length.out = 14),
+    seq(25, 55, length.out = 8),
+    seq(165, 190, length.out = 10)
+  )
+  hue_pool <- hue_pool[seq_len(min(length(hue_pool), n_stock_color))]
+  if (length(hue_pool) < n_stock_color) {
+    hue_pool <- rep(hue_pool, length.out = n_stock_color)
+  }
+  lum <- rep(c(55, 64), length.out = n_stock_color)
+  chroma <- rep(c(58, 46, 52), length.out = n_stock_color)
+  stock_colors[other_stock_symbols] <- grDevices::hcl(
+    h = hue_pool,
+    c = chroma,
+    l = lum,
+    fixup = TRUE
+  )
 }
 
 
@@ -1134,9 +1269,23 @@ ui <- fluidPage(
         .data-status { background:#f9fbfd; border:1px solid #e0e8f0; border-radius:12px; padding:16px; line-height:1.85; }
         .warning-note { background:#fffaf0; border-left:5px solid #dfb46f; padding:13px 16px; border-radius:8px; margin:10px 0; line-height:1.7; }
         .quick-button-row { margin:10px 0 15px; }
-        .quick-button-row .btn { margin-right:6px; margin-bottom:6px; border-radius:9px; }
-        .btn-primary, .action-button.btn-default { border-radius:9px; background:#6f9fd0; border-color:#6f9fd0; }
-        .btn-primary:hover, .action-button.btn-default:hover { background:#5f8fbe; border-color:#5f8fbe; }
+        .quick-button-row .btn,
+        .quick-button-row .action-button.btn-default {
+          margin-right:6px; margin-bottom:6px; border-radius:9px;
+          background:#ffffff; color:#53687b; border:1px solid #d8e1ea;
+          box-shadow:none;
+        }
+        .quick-button-row .btn:hover,
+        .quick-button-row .action-button.btn-default:hover {
+          background:#f4f8fc; color:#365d81; border-color:#bdd0e2;
+        }
+        .btn-primary { border-radius:9px; background:#6f9fd0; border-color:#6f9fd0; color:white; }
+        .btn-primary:hover { background:#5f8fbe; border-color:#5f8fbe; color:white; }
+        .time-scope-bar {
+          background:#f8fbfe; border:1px solid #e0e8f0; border-radius:11px;
+          padding:11px 14px; margin:12px 0 18px; color:#596f84; line-height:1.7;
+        }
+        .time-scope-bar strong { color:#385775; }
 
         table { background:white; }
         .table > thead > tr > th { background:#f0f5fa; color:#49647e; border-bottom:2px solid #d6e1eb; }
@@ -1534,6 +1683,7 @@ ui <- fluidPage(
           strong("這個模型比較重視什麼？ "),
           "我們偏好在不同期間都能維持相對一致表現、報酬合理，而且不需要承擔過度波動或深度回撤的股票。因此短期大漲但風險很高的股票，不一定會排在前面。"
         ),
+        uiOutput("model_time_scope_ui"),
         fluidRow(
           column(3, div(class="info-card accent-blue", div(class="info-card-title", "穩定性｜40%"), div("不同期間的報酬、排名與風險是否一致。"))),
           column(3, div(class="info-card accent-green", div(class="info-card-title", "報酬｜25%"), div("兼顧近期與中長期報酬，而不是只看單一期間。"))),
@@ -1541,6 +1691,16 @@ ui <- fluidPage(
           column(3, div(class="info-card accent-purple", div(class="info-card-title", "風險報酬效率｜15%"), div("承擔相同風險時，是否換到較好的報酬。")))
         ),
         
+        details(
+          class = "method-details",
+          tags$summary("查看綜合分數具體怎麼算"),
+          p("第一步：每個原始指標先在 0050 成分股之間轉成 0–100 分，避免百分比、回撤與夏普比率直接相加。"),
+          p("第二步：穩定性 = 30% 排名穩定 + 40% 報酬穩定 + 30% 風險穩定。排名與報酬跨 1週、1月、3月、6月、1年、3年比較；風險從 3個月以上開始比較。"),
+          p("第三步：報酬分數 = 70% 多時間尺度報酬 + 30% 近 1 年年化報酬。多時間尺度內部權重為：1週 5%、1月 10%、3月 15%、6月 20%、1年 30%、3年 20%。"),
+          p("第四步：風險控制分數 = 35% 波動度控制 + 35% 最大回撤控制 + 30% CVaR 尾端風險控制；這三項主要使用近 1 年資料。"),
+          p("第五步：綜合分數 = 40% 穩定性 + 25% 報酬 + 20% 風險控制 + 15% 風險報酬效率。"),
+          p("例：穩定性 80、報酬 70、風險控制 75、風險報酬效率 85，則綜合分數 = 80×0.40 + 70×0.25 + 75×0.20 + 85×0.15 = 77.25。")
+        ),
         h3("綜合分數前 10 名"),
         plotOutput("composite_ranking_chart", height = "520px"),
         
@@ -1577,8 +1737,9 @@ ui <- fluidPage(
         div(
           class = "reading-guide",
           strong("穩定性是什麼？ "),
-          "我們同時看 1 週、1 個月、3 個月、6 個月與 1 年。如果一檔股票在不同期間的報酬、相對排名與風險都沒有落差太大，穩定性分數就會較高。高穩定不等於報酬最高，而是代表結果比較不依賴某一段剛好特別好的行情。"
+          "我們同時看 1 週、1 個月、3 個月、6 個月、1 年與 3 年。報酬與排名使用六個時間尺度；風險穩定性則從 3 個月以上的期間比較，避免用只有幾天的資料硬算風險。高穩定不等於報酬最高，而是代表結果比較不依賴某一段剛好特別好的行情。"
         ),
+        uiOutput("model_time_scope_ui_risk"),
         
         h3("穩定性分數前 10 名"),
         plotOutput("stability_ranking_chart", height = "520px"),
@@ -1601,32 +1762,59 @@ ui <- fluidPage(
         class = "section-box",
         
         h2("主成分分析與分群"),
-        
+
         p(
           class = "page-description",
-          "主成分分析用來檢查多個投資指標是否包含重複資訊，再以主成分進行資料驅動的股票分群。"
+          "這一頁不是拿股價本身分群，而是把每一檔股票在同一段時間內的報酬、波動、回撤、尾端風險與風險報酬效率整理成統計特徵，再找出特性相近的股票。"
         ),
-        
+
+        fluidRow(
+          column(
+            4,
+            selectInput(
+              "pca_period",
+              "PCA／分群使用多久資料：",
+              choices = PCA_WINDOWS,
+              selected = 252
+            )
+          ),
+          column(8, uiOutput("pca_period_info"))
+        ),
+
         div(
           class = "reading-guide",
-          strong("方法說明："),
-          "先將指標標準化，再進行主成分分析；分群數不預先固定，而是比較不同群數的平均輪廓係數後選擇較適合的群數。"
+          strong("這頁實際拿什麼資料？ "),
+          "一檔股票就是一筆資料。每檔股票都只使用上方選定的同一段時間，計算：年化報酬、年化波動、最大回撤、CVaR、夏普比率、上漲日比例、21 日報酬變動程度與 21 日波動變動程度。先標準化後才做 PCA，因此不會因為某個指標數字本來比較大就支配結果。"
         ),
-        
+
+        div(
+          class = "method-note",
+          strong("為什麼不提供 1 週／1 個月 PCA？ "),
+          "PCA 與分群需要同時估計多個風險特徵；1 週只有約 5 個交易日、1 個月約 21 個交易日，CVaR、夏普與風險穩定度會非常不穩。因此本頁從 3 個月開始，預設近 1 年，3 年只作較長期對照。"
+        ),
+
+        h3("PCA 在整理什麼資訊？"),
+        uiOutput("pca_interpretation_ui"),
+
         h3("主成分解釋變異"),
         tableOutput("pca_variance_table"),
-        
+
         h3("主成分負荷量"),
         tableOutput("pca_loading_table"),
-        
+
         h3("分群數比較"),
         tableOutput("cluster_quality_table"),
-        
+
         h3("主成分分群圖"),
         plotOutput("pca_cluster_chart", height = "600px"),
-        
+        div(class="plot-explanation", strong("怎麼看？ "), "每一個點是一檔 0050 成分股；距離較近代表統計特徵比較相似。顏色代表 K-means 分到的群組，群組只用來描述股票特性，不直接決定綜合排名。"),
+
         h3("各群平均特徵"),
-        tableOutput("cluster_summary_table")
+        tableOutput("cluster_summary_table"),
+
+        h3("每一檔股票屬於哪一群？"),
+        uiOutput("cluster_filter_ui"),
+        tableOutput("cluster_member_table")
       )
     ),
     
@@ -1671,45 +1859,17 @@ ui <- fluidPage(
         
         div(
           class = "quick-button-row",
-          
+
           strong("快速期間："),
-          
-          actionButton(
-            "period_research",
-            "研究期間"
-          ),
-          
-          actionButton(
-            "period_all",
-            "全部"
-          ),
-          
-          actionButton(
-            "period_1m",
-            "1 個月"
-          ),
-          
-          actionButton(
-            "period_1q",
-            "1 季"
-          ),
-          
-          actionButton(
-            "period_6m",
-            "6 個月"
-          ),
-          
-          actionButton(
-            "period_1y",
-            "1 年"
-          ),
-          
-          actionButton(
-            "period_ytd",
-            "今年以來"
-          )
+          actionButton("period_1w", "1 週"),
+          actionButton("period_1m", "1 個月"),
+          actionButton("period_1q", "3 個月"),
+          actionButton("period_6m", "6 個月"),
+          actionButton("period_1y", "1 年"),
+          actionButton("period_3y", "3 年"),
+          actionButton("period_all", "全部")
         ),
-        
+
         dateRangeInput(
           "date_range",
           "分析期間：",
@@ -2017,11 +2177,12 @@ ui <- fluidPage(
             ),
             fluidRow(
               column(3, selectInput("bootstrap_stock", "比較成分股：", choices = setNames(stock_info$symbol, paste0(stock_info$name, " (", stock_info$symbol, ")")), selected = "2330")),
-              column(3, selectInput("bootstrap_years", "抽樣歷史期間：", choices = c("近 3 年" = 3, "近 5 年" = 5, "全部可用期間" = 0), selected = 3)),
+              column(3, selectInput("bootstrap_window", "抽樣使用期間：", choices = c("近 1 年" = 252, "近 3 年" = 756), selected = 252)),
               column(3, selectInput("bootstrap_block", "每個區塊多長：", choices = c("5 個交易日" = 5, "10 個交易日" = 10, "20 個交易日" = 20), selected = 10)),
               column(3, selectInput("bootstrap_reps", "重新抽幾次：", choices = c("50 次｜最快" = 50, "100 次｜建議" = 100, "200 次｜較完整" = 200), selected = 100))
             ),
             actionButton("run_bootstrap", "開始快速檢查", class = "btn-primary"),
+            uiOutput("bootstrap_period_info"),
             div(class = "method-note", "網站版以速度為優先，建議先用 100 次。正式報告若需要更穩定的區間，可在離線或每日更新流程中使用 1000 次以上，不需要讓每位使用者現場等待。"),
             h3("結果摘要"),
             tableOutput("bootstrap_summary_table"),
@@ -2034,23 +2195,41 @@ ui <- fluidPage(
             br(),
             div(
               class = "reading-guide",
-              strong("白話版： "),
-              "假裝回到過去，每一年都只能使用當時已經知道的資料做排名，再看排名較高與較低的股票，下一年是不是真的出現差異。這不是事後挑漂亮的買賣日期，而是在驗證排名方法本身。"
+              strong("這裡到底在驗證什麼？ "),
+              "假裝回到過去的某一天，只使用那一天以前能看到的資料，依照『現在網站同一套評分規則』重新計分與排名；接著往後觀察指定期間，看高分組是否真的比低分組更好。"
             ),
             fluidRow(
-              column(4, selectInput("backtest_lookback", "每次排名往回看多久：", choices=c("近 3 年"=3, "近 5 年"=5), selected=3)),
-              column(4, numericInput("backtest_start_year", "從哪個排名年度開始：", value=2019, min=2018, max=max(2019, as.integer(format(data_max_date, "%Y")) - 1), step=1)),
-              column(4, actionButton("run_backtest", "執行歷史回測", class="btn-primary"))
+              column(3, selectInput(
+                "backtest_horizon",
+                "評分後往前看多久：",
+                choices = BACKTEST_HORIZONS,
+                selected = 252
+              )),
+              column(3, selectInput(
+                "backtest_weight_profile",
+                "要驗證哪組權重：",
+                choices = setNames(names(WEIGHT_PROFILE_LABELS), WEIGHT_PROFILE_LABELS),
+                selected = "baseline"
+              )),
+              column(3, numericInput("backtest_start_year", "最早從哪一年開始驗證：", value=2019, min=2019, max=max(2019, as.integer(format(data_max_date, "%Y"))), step=1)),
+              column(3, br(), actionButton("run_backtest", "執行評分模型驗證", class="btn-primary"))
             ),
-            div(class = "warning-note", strong("研究限制： "), "目前回測仍以現有成分股名單往回分析，因此較早年份可能有『存活者偏差』。簡單說，就是今天還在 0050 裡的公司，本來就可能是過去表現相對好的公司；正式報告會把這項限制明確寫出來。"),
+            div(
+              class="time-scope-bar",
+              strong("評分時使用的資料： "),
+              "與目前主模型一致──報酬／穩定性同時看近 1週、1月、3月、6月、1年、3年；風險控制與夏普主要使用當時往回近 1 年。最長只看到當時以前 3 年，不會使用未來資料。"
+            ),
+            div(class = "warning-note", strong("研究限制： "), "目前回測仍以現有成分股名單往回分析，因此較早年份可能有『存活者偏差』。此外，2～5 年的後續驗證因資料長度較長，有效驗證次數會自然變少，結果旁邊會直接顯示樣本數。"),
             uiOutput("backtest_status"),
-            h3("累積回測結果"),
+            h3("每次驗證的後續報酬"),
             plotOutput("backtest_cumulative_chart", height="520px"),
-            h3("模型驗證摘要"),
+            h3("Top／Bottom 與 0050 比較"),
             tableOutput("backtest_summary_table"),
-            h3("逐年結果"),
+            h3("分數排名與未來表現是否同方向？"),
+            tableOutput("backtest_rank_corr_table"),
+            h3("各次驗證結果"),
             tableOutput("backtest_yearly_table"),
-            div(class="plot-explanation", strong("怎麼看？ "), "我們不是在找一條最漂亮的策略線，而是看排名高的組別是否經常比排名低的組別好，以及 Top 組合有多少年度能勝過 0050。")
+            div(class="plot-explanation", strong("怎麼看？ "), "如果模型具有區辨能力，理想上 Top 組的後續報酬或風險調整後表現應較常優於 Bottom 組；Spearman 等級相關若長期偏正，也代表分數越高的股票，之後越傾向排在前面。")
           )
         )
       )
@@ -2069,6 +2248,14 @@ ui <- fluidPage(
         p(class="page-description", "如果看到某個名詞不知道在說什麼，可以回到這一頁。每個重要指標都會先用白話說明『它是什麼、怎麼看、要注意什麼』，需要時再看計算方式。"),
         div(class="reading-guide", strong("核心原則： "), "價格用來觀察走勢；日對數報酬率用來進行主要統計分析。網站結果為統計研究與歷史資料分析，不構成投資建議。"),
         tags$details(class="method-details", open=NA,
+          tags$summary("全站時間規則：每個結果到底用了多久資料？"),
+          p("統一時間尺度為：1週約5個交易日、1個月21日、3個月63日、6個月126日、1年252日、3年756日。"),
+          p("主排名：風險控制與夏普主要使用近1年；報酬與穩定性同時比較1週、1月、3月、6月、1年、3年，避免只看太久以前的資料。"),
+          p("PCA／分群：使用者可選3月、6月、1年、3年；同一次分析的所有特徵都使用相同起訖期間，預設近1年。"),
+          p("區塊拔靴法：明確顯示抽樣使用的近1年或近3年。"),
+          p("評分模型驗證：『評分時』只使用當時以前最多3年資料；『評分後』再依你選的1週～5年觀察未來，兩個時間完全分開。")
+        ),
+        tags$details(class="method-details", open=NA,
           tags$summary("日對數報酬率：是什麼、怎麼算、怎麼看？"),
           p("定義：相鄰兩個交易日價格變化的對數形式。"),
           p("計算：ln(今日調整後價格 / 昨日調整後價格)。"),
@@ -2083,7 +2270,7 @@ ui <- fluidPage(
         tags$details(class="method-details",
           tags$summary("我們的綜合評分到底在挑什麼？"),
           p("我們不是單純推薦『過去漲最多』的股票，而是偏好長期表現比較一致、報酬合理、風險不要過度偏高，而且承擔風險後仍能換到不錯報酬的股票。"),
-          p("穩定性分數：同時比較 1 週、1 個月、3 個月、6 個月與 1 年。如果報酬、排名和風險在不同期間都相對一致，分數就會比較高。它代表『表現是否穩定』，不是『報酬是否最高』。"),
+          p("穩定性分數：同時比較 1 週、1 個月、3 個月、6 個月、1 年與 3 年。如果報酬、排名和風險在不同期間都相對一致，分數就會比較高。它代表『表現是否穩定』，不是『報酬是否最高』。"),
           p("風險控制分數：把波動度、最大回撤與極端損失一起看。分數越高，代表這些風險相對比較可控。"),
           p("風險報酬效率：以夏普比率為主。簡單說，就是承擔同樣風險時，誰換到的報酬比較多。"),
           p("綜合分數：目前權重為穩定性 40%、報酬 25%、風險控制 20%、風險報酬效率 15%。0050 也會得到自己的分數，但只當比較基準，不參與成分股名次。")
@@ -2095,13 +2282,15 @@ ui <- fluidPage(
         ),
         tags$details(class="method-details",
           tags$summary("歷史回測：如果以前真的照這個排名看，後來呢？"),
-          p("做法：假裝回到每一個過去的年底，只使用當時已經知道的資料做排名，再看下一年的實際表現。"),
-          p("怎麼看：如果 Top 組合在很多不同年度都比 Bottom 組合好，而且常常能勝過 0050，代表這套排名比較可能真的有區分能力，而不是只對整段歷史資料看起來漂亮。")
+          p("做法：假裝回到過去不同時間點，只使用當時以前的資料重新評分；再依選定的1週、1月、3月、6月、1年、2年、3年或5年觀察後續結果。"),
+          p("怎麼看：除了 Top／Bottom 與 0050 的報酬、波動、回撤、夏普與勝率，也計算 Spearman 等級相關，直接檢查『分數越高，未來是否越傾向表現較好』。"),
+          p("權重敏感度：可切換目前版40/25/20/15、均衡版35/30/20/15、報酬稍強版30/35/20/15，用同一套歷史驗證比較，而不是憑感覺挑權重。")
         ),
         tags$details(class="method-details",
           tags$summary("主成分分析與分群：把複雜指標整理成比較好懂的類型"),
-          p("主成分分析：如果波動度、回撤、條件風險值其實都在講很相似的事情，主成分分析可以把重複資訊整理成幾個主要方向。"),
-          p("分群：再把統計特性相近的股票自動分成幾類，例如低波動穩定型或高報酬高風險型。分群是用來解釋股票特色，不直接決定排名。")
+          p("主成分分析：每檔股票在同一選定期間內計算年化報酬、波動、最大回撤、CVaR、夏普、上漲日比例，以及21日報酬／波動變動程度；標準化後再做PCA，避免尺度不同。"),
+          p("分群：使用能解釋約80%資訊的前幾個主成分進行K-means，再用輪廓係數比較群數。頁面會直接列出每一檔股票屬於哪一群，以及每群的平均特徵。"),
+          p("時間：可選近3月、6月、1年或3年，預設近1年；不使用1週／1月做正式PCA，因為風險指標樣本太少。")
         ),
         h3("目前資料清單與有效期間"),
         tableOutput("stock_table"),
@@ -2181,7 +2370,7 @@ server <- function(input, output, session) {
   # ==========================================================
   
   research_metrics <- reactive({
-    
+
     x <- data() %>%
       filter(
         symbol %in% dashboard_symbols,
@@ -2189,21 +2378,43 @@ server <- function(input, output, session) {
         is.finite(adjusted)
       ) %>%
       arrange(symbol, date)
-    
+
     req(nrow(x) > 0)
-    
+
     # --------------------------------------------------------
-    # 長期基礎指標
+    # 近 1 年：風險、回撤、CVaR、Sharpe 的主要比較視窗
     # --------------------------------------------------------
+    risk_end_date <- max(x$date, na.rm = TRUE)
+    risk_start_date <- window_start_from_dates(
+      sort(unique(x$date)),
+      PRIMARY_RISK_WINDOW,
+      risk_end_date
+    )
+
     base <- x %>%
+      filter(date >= risk_start_date, date <= risk_end_date) %>%
       group_by(symbol) %>%
       summarise(
         n_obs = n(),
-        annual_return = exp(mean(log_return, na.rm = TRUE) * TRADING_DAYS_PER_YEAR) - 1,
-        annual_volatility = sd(log_return, na.rm = TRUE) * sqrt(TRADING_DAYS_PER_YEAR),
-        max_drawdown = min(drawdown_value(adjusted), na.rm = TRUE),
-        cvar_95 = cvar_value(log_return, 0.95),
-        mean_daily_log = mean(log_return, na.rm = TRUE),
+        analysis_start = min(date, na.rm = TRUE),
+        analysis_end = max(date, na.rm = TRUE),
+        annual_return = ifelse(
+          n_obs >= floor(PRIMARY_RISK_WINDOW * 0.75),
+          exp(mean(log_return, na.rm = TRUE) * TRADING_DAYS_PER_YEAR) - 1,
+          NA_real_
+        ),
+        annual_volatility = ifelse(
+          n_obs >= floor(PRIMARY_RISK_WINDOW * 0.75),
+          sd(log_return, na.rm = TRUE) * sqrt(TRADING_DAYS_PER_YEAR),
+          NA_real_
+        ),
+        max_drawdown = ifelse(
+          n_obs >= floor(PRIMARY_RISK_WINDOW * 0.75),
+          min(drawdown_value(adjusted), na.rm = TRUE),
+          NA_real_
+        ),
+        cvar_95 = ifelse(n_obs >= floor(PRIMARY_RISK_WINDOW * 0.75), cvar_value(log_return, 0.95), NA_real_),
+        mean_daily_log = ifelse(n_obs >= floor(PRIMARY_RISK_WINDOW * 0.75), mean(log_return, na.rm = TRUE), NA_real_),
         .groups = "drop"
       ) %>%
       mutate(
@@ -2213,53 +2424,85 @@ server <- function(input, output, session) {
           NA_real_
         )
       )
-    
+
     # --------------------------------------------------------
-    # 1週 / 1月 / 3月 / 6月 / 1年
+    # 統一六個滾動時間尺度：1週 / 1月 / 3月 / 6月 / 1年 / 3年
     # --------------------------------------------------------
-    period_days <- c(`1週` = 5, `1個月` = 21, `3個月` = 63, `6個月` = 126, `1年` = 252)
-    period_weights <- c(`1週` = 0.05, `1個月` = 0.10, `3個月` = 0.20, `6個月` = 0.25, `1年` = 0.40)
-    
+    period_days <- TIME_WINDOWS
+    period_weights <- RETURN_WINDOW_WEIGHTS
+
     period_list <- lapply(
       names(period_days),
       function(period_name) {
         n_day <- period_days[[period_name]]
+        period_end_date <- max(x$date, na.rm = TRUE)
+        period_start_date <- window_start_from_dates(
+          sort(unique(x$date)),
+          n_day,
+          period_end_date
+        )
         x %>%
+          filter(date >= period_start_date, date <= period_end_date) %>%
           group_by(symbol) %>%
           arrange(date, .by_group = TRUE) %>%
-          slice_tail(n = n_day) %>%
           summarise(
             period = period_name,
             n = n(),
-            period_log_return = ifelse(n >= max(3, floor(n_day * 0.75)), sum(log_return, na.rm = TRUE), NA_real_),
-            annualized_log_mean = ifelse(n >= max(3, floor(n_day * 0.75)), mean(log_return, na.rm = TRUE) * TRADING_DAYS_PER_YEAR, NA_real_),
-            annualized_volatility = ifelse(n >= max(3, floor(n_day * 0.75)), sd(log_return, na.rm = TRUE) * sqrt(TRADING_DAYS_PER_YEAR), NA_real_),
+            period_start = min(date, na.rm = TRUE),
+            period_end = max(date, na.rm = TRUE),
+            period_log_return = ifelse(
+              n >= max(3, floor(n_day * 0.75)),
+              sum(log_return, na.rm = TRUE),
+              NA_real_
+            ),
+            annualized_log_mean = ifelse(
+              n >= max(3, floor(n_day * 0.75)),
+              mean(log_return, na.rm = TRUE) * TRADING_DAYS_PER_YEAR,
+              NA_real_
+            ),
+            annualized_volatility = ifelse(
+              n >= max(20, floor(n_day * 0.75)),
+              sd(log_return, na.rm = TRUE) * sqrt(TRADING_DAYS_PER_YEAR),
+              NA_real_
+            ),
             .groups = "drop"
           )
       }
     )
-    
+
     period_long <- bind_rows(period_list) %>%
       group_by(period) %>%
       mutate(return_percentile = cross_section_score(period_log_return, TRUE)) %>%
       ungroup()
-    
+
     # --------------------------------------------------------
-    # 跨期間穩定性：排名、報酬、風險
+    # 跨期間穩定性
+    # 排名 / 報酬：六個尺度；風險：從 3 個月起算，避免短樣本失真。
     # --------------------------------------------------------
-    stability_raw <- period_long %>%
+    stability_rank_return <- period_long %>%
       group_by(symbol) %>%
       summarise(
         rank_variation = sd(return_percentile, na.rm = TRUE),
         return_variation = sd(annualized_log_mean, na.rm = TRUE),
-        risk_variation = sd(annualized_volatility, na.rm = TRUE),
         valid_periods = sum(is.finite(period_log_return)),
         .groups = "drop"
-      ) %>%
+      )
+
+    stability_risk <- period_long %>%
+      filter(period %in% c("3個月", "6個月", "1年", "3年")) %>%
+      group_by(symbol) %>%
+      summarise(
+        risk_variation = sd(annualized_volatility, na.rm = TRUE),
+        valid_risk_periods = sum(is.finite(annualized_volatility)),
+        .groups = "drop"
+      )
+
+    stability_raw <- stability_rank_return %>%
+      left_join(stability_risk, by = "symbol") %>%
       mutate(
         rank_variation = ifelse(valid_periods >= 3, rank_variation, NA_real_),
         return_variation = ifelse(valid_periods >= 3, return_variation, NA_real_),
-        risk_variation = ifelse(valid_periods >= 3, risk_variation, NA_real_),
+        risk_variation = ifelse(valid_risk_periods >= 2, risk_variation, NA_real_),
         rank_stability_score = cross_section_score(rank_variation, FALSE),
         return_stability_score = cross_section_score(return_variation, FALSE),
         risk_stability_score = cross_section_score(risk_variation, FALSE),
@@ -2268,26 +2511,23 @@ server <- function(input, output, session) {
           0.40 * return_stability_score +
           0.30 * risk_stability_score
       )
-    
+
     # --------------------------------------------------------
-    # 多期間報酬分數
+    # 多時間尺度報酬分數
     # --------------------------------------------------------
-    period_scored <- period_long %>%
-      mutate(weight = period_weights[period])
-    
-    multi_return <- period_scored %>%
+    multi_return <- period_long %>%
+      mutate(weight = period_weights[period]) %>%
       group_by(symbol) %>%
       summarise(
-        multi_period_return_score =
-          ifelse(
-            sum(is.finite(return_percentile)) >= 3,
-            weighted.mean(return_percentile, weight, na.rm = TRUE),
-            NA_real_
-          ),
+        multi_period_return_score = ifelse(
+          sum(is.finite(return_percentile)) >= 3,
+          weighted.mean(return_percentile, weight, na.rm = TRUE),
+          NA_real_
+        ),
         .groups = "drop"
       )
-    
-    # 把各期間資料轉寬，方便近期轉弱標籤。
+
+    # 各期間轉寬，供近期轉弱標籤使用。
     period_wide <- period_long %>%
       select(symbol, period, period_log_return, return_percentile) %>%
       pivot_wider(
@@ -2295,7 +2535,7 @@ server <- function(input, output, session) {
         values_from = c(period_log_return, return_percentile),
         names_sep = "_"
       )
-    
+
     # --------------------------------------------------------
     # 四大面向分數
     # --------------------------------------------------------
@@ -2314,19 +2554,19 @@ server <- function(input, output, session) {
         return_score = 0.70 * multi_period_return_score + 0.30 * annual_return_score,
         risk_score = 0.35 * volatility_score + 0.35 * drawdown_score + 0.30 * cvar_score,
         composite_score =
-          0.40 * stability_score +
-          0.25 * return_score +
-          0.20 * risk_score +
-          0.15 * sharpe_score
+          MODEL_WEIGHTS[["stability"]] * stability_score +
+          MODEL_WEIGHTS[["ret"]] * return_score +
+          MODEL_WEIGHTS[["risk"]] * risk_score +
+          MODEL_WEIGHTS[["sharpe"]] * sharpe_score
       )
-    
+
     # --------------------------------------------------------
     # 0050 比較基準
     # --------------------------------------------------------
     benchmark_score <- score %>%
       filter(symbol == "0050") %>%
       slice_head(n = 1)
-    
+
     if (nrow(benchmark_score) == 1) {
       score <- score %>%
         mutate(
@@ -2344,7 +2584,7 @@ server <- function(input, output, session) {
           relative_0050 = "無法比較"
         )
     }
-    
+
     # --------------------------------------------------------
     # 固定標籤庫：同時參考 0050 與成分股分布
     # --------------------------------------------------------
@@ -2354,13 +2594,13 @@ server <- function(input, output, session) {
     q_vol_80 <- quantile(component$annual_volatility, 0.80, na.rm = TRUE)
     q_dd_20 <- quantile(component$max_drawdown, 0.20, na.rm = TRUE)
     q_cvar_20 <- quantile(component$cvar_95, 0.20, na.rm = TRUE)
-    
+
     b_ann_return <- if (nrow(benchmark_score) == 1) benchmark_score$annual_return else NA_real_
     b_stability <- if (nrow(benchmark_score) == 1) benchmark_score$stability_score else NA_real_
     b_vol <- if (nrow(benchmark_score) == 1) benchmark_score$annual_volatility else NA_real_
     b_dd <- if (nrow(benchmark_score) == 1) benchmark_score$max_drawdown else NA_real_
     b_cvar <- if (nrow(benchmark_score) == 1) benchmark_score$cvar_95 else NA_real_
-    
+
     score$labels <- vapply(
       seq_len(nrow(score)),
       function(i) {
@@ -2382,50 +2622,143 @@ server <- function(input, output, session) {
       },
       character(1)
     )
-    
+
     score %>%
       mutate(
         name = get_stock_name(symbol),
         industry = get_stock_industry(symbol)
       )
   })
-  
+
+  output$model_time_scope_ui <- renderUI({
+    d <- sort(unique(data()$date))
+    end_d <- max(d, na.rm = TRUE)
+    one_year_start <- window_start_from_dates(d, PRIMARY_RISK_WINDOW, end_d)
+    three_year_start <- window_start_from_dates(d, TIME_WINDOWS[["3年"]], end_d)
+    div(
+      class = "time-scope-bar",
+      strong("目前評分使用的時間： "),
+      paste0(
+        "風險控制與夏普主要使用近 1 年（", format(one_year_start, "%Y-%m-%d"), " ～ ", format(end_d, "%Y-%m-%d"), "）；",
+        "報酬與穩定性同時比較 1週、1月、3月、6月、1年、3年。最長背景從 ",
+        format(three_year_start, "%Y-%m-%d"), " 起，不使用 2016 至今全部歷史。"
+      )
+    )
+  })
+
+  output$model_time_scope_ui_risk <- renderUI({
+    d <- sort(unique(data()$date))
+    end_d <- max(d, na.rm = TRUE)
+    one_year_start <- window_start_from_dates(d, PRIMARY_RISK_WINDOW, end_d)
+    div(
+      class = "time-scope-bar",
+      strong("風險指標期間： "),
+      paste0(
+        "表格中的年化波動、最大回撤、CVaR、夏普主要取近 1 年：",
+        format(one_year_start, "%Y-%m-%d"), " ～ ", format(end_d, "%Y-%m-%d"),
+        "。穩定性則跨 1週～3年比較。"
+      )
+    )
+  })
+
   # ==========================================================
   # 1-2. 主成分與分群
   # ==========================================================
   
-  pca_cluster_result <- reactive({
-    m <- research_metrics() %>%
-      filter(symbol %in% stock_info$symbol) %>%
-      select(
-        symbol, name, industry,
-        annual_return, annual_volatility,
-        max_drawdown, cvar_95, sharpe, stability_score,
-        composite_score, return_score, risk_score
+  pca_feature_data <- reactive({
+    n_day <- as.integer(if (is.null(input$pca_period)) 252 else input$pca_period)
+    d <- sort(unique(data()$date))
+    end_date <- max(d, na.rm = TRUE)
+    start_date <- window_start_from_dates(d, n_day, end_date)
+
+    x <- data() %>%
+      filter(
+        symbol %in% stock_info$symbol,
+        date >= start_date,
+        date <= end_date,
+        is.finite(log_return),
+        is.finite(adjusted)
+      ) %>%
+      arrange(symbol, date)
+
+    out <- x %>%
+      group_by(symbol) %>%
+      group_modify(~{
+        r <- .x$log_return
+        px <- .x$adjusted
+        n_obs <- sum(is.finite(r))
+        required_obs <- max(20, floor(n_day * 0.80))
+        ann_vol <- if (n_obs >= required_obs) sd(r, na.rm=TRUE) * sqrt(TRADING_DAYS_PER_YEAR) else NA_real_
+        roll21_ret <- as.numeric(stats::filter(r, rep(1, 21), sides = 1))
+        roll21_vol <- rolling_sd_fast(r, 21) * sqrt(TRADING_DAYS_PER_YEAR)
+        data.frame(
+          n_obs = n_obs,
+          period_start = min(.x$date, na.rm=TRUE),
+          period_end = max(.x$date, na.rm=TRUE),
+          coverage_ratio = n_obs / n_day,
+          annual_return = ifelse(n_obs >= required_obs, exp(mean(r, na.rm=TRUE) * TRADING_DAYS_PER_YEAR) - 1, NA_real_),
+          annual_volatility = ann_vol,
+          max_drawdown = ifelse(n_obs >= required_obs, min(drawdown_value(px), na.rm=TRUE), NA_real_),
+          cvar_95 = ifelse(n_obs >= required_obs, cvar_value(r, 0.95), NA_real_),
+          sharpe = ifelse(is.finite(ann_vol) && ann_vol > 0,
+                          mean(r, na.rm=TRUE) * TRADING_DAYS_PER_YEAR / ann_vol, NA_real_),
+          positive_day_ratio = ifelse(n_obs >= required_obs, mean(r > 0, na.rm=TRUE), NA_real_),
+          return_variability_21d = ifelse(sum(is.finite(roll21_ret)) >= 10, sd(roll21_ret, na.rm=TRUE), NA_real_),
+          volatility_variability_21d = ifelse(sum(is.finite(roll21_vol)) >= 10, sd(roll21_vol, na.rm=TRUE), NA_real_)
+        )
+      }) %>%
+      ungroup() %>%
+      mutate(
+        name = get_stock_name(symbol),
+        industry = get_stock_industry(symbol)
       )
-    
+
+    # 加入主排名結果只是顯示參考，不放進 PCA / K-means。
+    out %>%
+      left_join(
+        research_metrics() %>%
+          select(symbol, composite_score, stability_score, return_score, risk_score),
+        by = "symbol"
+      )
+  })
+
+  pca_cluster_result <- reactive({
+    m <- pca_feature_data()
+
     feature_names <- c(
       "annual_return",
       "annual_volatility",
       "max_drawdown",
       "cvar_95",
       "sharpe",
-      "stability_score"
+      "positive_day_ratio",
+      "return_variability_21d",
+      "volatility_variability_21d"
     )
-    
+
     ok <- complete.cases(m[, feature_names])
     m2 <- m[ok, , drop = FALSE]
-    req(nrow(m2) >= 6)
-    
+    req(nrow(m2) >= 8)
+
+    # 移除極少數可能出現的零變異欄位，避免 prcomp(scale.=TRUE) 失敗。
+    feature_sd <- vapply(m2[, feature_names, drop=FALSE], sd, numeric(1), na.rm=TRUE)
+    use_features <- feature_names[is.finite(feature_sd) & feature_sd > 1e-12]
+    req(length(use_features) >= 3)
+
     pca <- prcomp(
-      m2[, feature_names],
+      m2[, use_features, drop=FALSE],
       center = TRUE,
       scale. = TRUE
     )
-    
-    pc_count <- min(3, ncol(pca$x))
+
+    # 分群使用能解釋至少 80% 變異的主成分，至少 2 個、最多 5 個。
+    variance <- (pca$sdev ^ 2) / sum(pca$sdev ^ 2)
+    cum_var <- cumsum(variance)
+    pc_count <- which(cum_var >= 0.80)[1]
+    if (!is.finite(pc_count)) pc_count <- min(3, ncol(pca$x))
+    pc_count <- max(2, min(pc_count, 5, ncol(pca$x)))
     cluster_x <- pca$x[, seq_len(pc_count), drop = FALSE]
-    
+
     max_k <- min(6, nrow(m2) - 1)
     k_candidates <- 2:max_k
     quality <- lapply(
@@ -2441,48 +2774,110 @@ server <- function(input, output, session) {
         )
       }
     ) %>% bind_rows()
-    
+
     best_k <- quality$k[which.max(quality$silhouette)]
     set.seed(50)
     km <- kmeans(cluster_x, centers = best_k, nstart = 50)
-    
+
     m2$cluster <- km$cluster
     m2$PC1 <- pca$x[, 1]
     m2$PC2 <- if (ncol(pca$x) >= 2) pca$x[, 2] else 0
-    
-    # 依每群平均特徵命名；保留群號避免不同群得到同名。
+
+    # 依群組「實際平均統計特徵」命名，不預先指定第幾群是哪種類型。
+    global_medians <- list(
+      ret = median(m2$annual_return, na.rm=TRUE),
+      vol = median(m2$annual_volatility, na.rm=TRUE),
+      dd = median(m2$max_drawdown, na.rm=TRUE),
+      cvar = median(m2$cvar_95, na.rm=TRUE),
+      sharpe = median(m2$sharpe, na.rm=TRUE),
+      retvar = median(m2$return_variability_21d, na.rm=TRUE),
+      volvar = median(m2$volatility_variability_21d, na.rm=TRUE)
+    )
+
     group_character <- m2 %>%
       group_by(cluster) %>%
       summarise(
-        stability = mean(stability_score, na.rm = TRUE),
-        return = mean(return_score, na.rm = TRUE),
-        risk = mean(risk_score, na.rm = TRUE),
-        composite = mean(composite_score, na.rm = TRUE),
+        annual_return = mean(annual_return, na.rm=TRUE),
+        annual_volatility = mean(annual_volatility, na.rm=TRUE),
+        max_drawdown = mean(max_drawdown, na.rm=TRUE),
+        cvar_95 = mean(cvar_95, na.rm=TRUE),
+        sharpe = mean(sharpe, na.rm=TRUE),
+        return_variability_21d = mean(return_variability_21d, na.rm=TRUE),
+        volatility_variability_21d = mean(volatility_variability_21d, na.rm=TRUE),
         .groups = "drop"
       ) %>%
       mutate(
         type = case_when(
-          stability >= 70 & return >= 60 ~ "穩健成長型",
-          stability >= 70 ~ "穩健型",
-          return >= 70 & risk < 50 ~ "高報酬高風險型",
-          risk < 40 ~ "高波動型",
-          TRUE ~ "平衡型"
+          annual_volatility <= global_medians$vol &
+            max_drawdown >= global_medians$dd &
+            return_variability_21d <= global_medians$retvar ~ "低波動穩定型",
+          annual_return >= global_medians$ret &
+            sharpe >= global_medians$sharpe &
+            annual_volatility <= global_medians$vol ~ "報酬效率型",
+          annual_return >= global_medians$ret &
+            annual_volatility > global_medians$vol ~ "高報酬高風險型",
+          max_drawdown < global_medians$dd & cvar_95 < global_medians$cvar ~ "深度回撤型",
+          TRUE ~ "均衡型"
         ),
         cluster_label = paste0("第", cluster, "群｜", type)
       )
-    
+
     m2 <- m2 %>%
       left_join(group_character %>% select(cluster, cluster_label), by = "cluster")
-    
+
     list(
       data = m2,
       pca = pca,
       quality = quality,
       best_k = best_k,
-      group_character = group_character
+      pc_count = pc_count,
+      use_features = use_features,
+      group_character = group_character,
+      period_days = as.integer(if (is.null(input$pca_period)) 252 else input$pca_period)
     )
   })
-  
+
+  pca_feature_labels <- c(
+    annual_return = "期間年化報酬",
+    annual_volatility = "年化波動度",
+    max_drawdown = "最大回撤",
+    cvar_95 = "95% CVaR",
+    sharpe = "夏普比率",
+    positive_day_ratio = "上漲日比例",
+    return_variability_21d = "21日報酬變動程度",
+    volatility_variability_21d = "21日波動變動程度"
+  )
+
+  output$pca_period_info <- renderUI({
+    n_day <- as.integer(if (is.null(input$pca_period)) 252 else input$pca_period)
+    d <- sort(unique(data()$date))
+    end_date <- max(d, na.rm=TRUE)
+    start_date <- window_start_from_dates(d, n_day, end_date)
+    div(
+      class="time-scope-bar",
+      strong("目前 PCA／分群期間： "),
+      paste0(window_label(n_day), "｜", format(start_date, "%Y-%m-%d"), " ～ ", format(end_date, "%Y-%m-%d"), "｜約 ", n_day, " 個交易日｜股票至少需有 80% 有效觀測")
+    )
+  })
+
+  output$pca_interpretation_ui <- renderUI({
+    r <- pca_cluster_result()
+    rot <- r$pca$rotation
+    pcs <- seq_len(min(2, ncol(rot)))
+    blocks <- lapply(pcs, function(j) {
+      vals <- abs(rot[, j])
+      top <- names(sort(vals, decreasing=TRUE))[seq_len(min(3, length(vals)))]
+      labels <- unname(pca_feature_labels[top])
+      div(
+        class="reading-guide",
+        strong(paste0("PC", j, " 主要由：")),
+        paste(labels, collapse="、"),
+        "。負荷量正負號本身可以整體翻轉，因此這裡重點看『哪些指標影響最大』，不把正負號直接解讀成好或壞。"
+      )
+    })
+    tagList(blocks)
+  })
+
   
   # ==========================================================
   # 2. 共用日期工具
@@ -3476,6 +3871,17 @@ server <- function(input, output, session) {
   
   
   observeEvent(
+    input$period_1w,
+    {
+      dates <- trading_dates()
+      n <- length(dates)
+      if (n >= 5) {
+        update_analysis_range(dates[n - 4], dates[n])
+      }
+    }
+  )
+
+  observeEvent(
     input$period_1m,
     {
       dates <- trading_dates()
@@ -3539,6 +3945,19 @@ server <- function(input, output, session) {
   )
   
   
+  observeEvent(
+    input$period_3y,
+    {
+      dates <- trading_dates()
+      n <- length(dates)
+      if (n >= 756) {
+        update_analysis_range(dates[n - 755], dates[n])
+      } else if (n >= 2) {
+        update_analysis_range(dates[1], dates[n])
+      }
+    }
+  )
+
   observeEvent(
     input$period_ytd,
     {
@@ -5119,95 +5538,156 @@ server <- function(input, output, session) {
   }, striped = FALSE, bordered = TRUE, hover = TRUE)
   
   output$pca_variance_table <- renderTable({
-    p <- pca_cluster_result()$pca
+    r <- pca_cluster_result()
+    p <- r$pca
     variance <- (p$sdev ^ 2) / sum(p$sdev ^ 2)
     data.frame(
       主成分 = paste0("PC", seq_along(variance)),
       解釋變異比例 = paste0(round(variance * 100, 2), "%"),
       累積比例 = paste0(round(cumsum(variance) * 100, 2), "%"),
+      分群是否使用 = ifelse(seq_along(variance) <= r$pc_count, "是", "否"),
       stringsAsFactors = FALSE
     )
   }, striped = FALSE, bordered = TRUE, hover = TRUE)
-  
+
   output$pca_loading_table <- renderTable({
     p <- pca_cluster_result()$pca
     loading <- as.data.frame(round(p$rotation[, seq_len(min(3, ncol(p$rotation))), drop = FALSE], 3))
-    loading$指標 <- rownames(loading)
-    loading <- loading %>% select(指標, everything())
-    names(loading)[1] <- "原始指標"
+    loading$feature_key <- rownames(loading)
+    loading$原始指標 <- unname(pca_feature_labels[loading$feature_key])
+    loading <- loading %>% select(原始指標, everything(), -feature_key)
     loading
   }, striped = FALSE, bordered = TRUE, hover = TRUE)
-  
+
   output$cluster_quality_table <- renderTable({
-    x <- pca_cluster_result()$quality %>%
+    r <- pca_cluster_result()
+    x <- r$quality %>%
       mutate(
         群數 = k,
         群內平方和 = round(total_withinss, 2),
         平均輪廓係數 = round(silhouette, 3),
-        建議 = ifelse(k == pca_cluster_result()$best_k, "目前較佳", "")
+        建議 = ifelse(k == r$best_k, "目前較佳", "")
       ) %>%
       select(群數, 群內平方和, 平均輪廓係數, 建議)
     x
   }, striped = FALSE, bordered = TRUE, hover = TRUE)
-  
+
   output$pca_cluster_chart <- renderPlot({
-    x <- pca_cluster_result()$data
+    r <- pca_cluster_result()
+    x <- r$data
     req(nrow(x) > 0)
     ggplot(x, aes(x = PC1, y = PC2, color = cluster_label, label = symbol)) +
       geom_point(size = 3) +
-      geom_text(vjust = -0.7, size = 3) +
+      geom_text(vjust = -0.7, size = 3, show.legend = FALSE) +
       labs(
-        title = paste0("主成分分群圖（", pca_cluster_result()$best_k, " 群）"),
-        x = "第一主成分",
-        y = "第二主成分",
+        title = paste0("主成分分群圖｜", window_label(r$period_days), "（", r$best_k, " 群）"),
+        subtitle = paste0("分群使用前 ", r$pc_count, " 個主成分，累積解釋至少約 80% 的資訊"),
+        x = "第一主成分（PC1）",
+        y = "第二主成分（PC2）",
         color = "分群"
       ) +
       theme_minimal() +
       theme(
         plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5),
         legend.position = "bottom"
       )
   })
-  
+
   output$cluster_summary_table <- renderTable({
-    x <- pca_cluster_result()$data %>%
+    r <- pca_cluster_result()
+    r$data %>%
       group_by(cluster_label) %>%
       summarise(
         股票數 = n(),
+        平均年化報酬 = mean(annual_return, na.rm = TRUE),
+        平均年化波動 = mean(annual_volatility, na.rm = TRUE),
+        平均最大回撤 = mean(max_drawdown, na.rm = TRUE),
+        平均CVaR = mean(cvar_95, na.rm = TRUE),
+        平均夏普 = mean(sharpe, na.rm = TRUE),
         平均綜合分數 = mean(composite_score, na.rm = TRUE),
-        平均穩定性 = mean(stability_score, na.rm = TRUE),
-        平均報酬分數 = mean(return_score, na.rm = TRUE),
-        平均風險控制分數 = mean(risk_score, na.rm = TRUE),
         .groups = "drop"
       ) %>%
       mutate(
-        平均綜合分數 = fmt_score(平均綜合分數),
-        平均穩定性 = fmt_score(平均穩定性),
-        平均報酬分數 = fmt_score(平均報酬分數),
-        平均風險控制分數 = fmt_score(平均風險控制分數)
+        平均年化報酬 = fmt_pct(平均年化報酬, 2, TRUE),
+        平均年化波動 = fmt_pct(平均年化波動, 2, FALSE),
+        平均最大回撤 = fmt_pct(平均最大回撤, 2, TRUE),
+        平均CVaR = fmt_pct(平均CVaR, 2, TRUE),
+        平均夏普 = ifelse(is.finite(平均夏普), sprintf("%.3f", 平均夏普), "NA"),
+        平均綜合分數 = fmt_score(平均綜合分數)
       ) %>%
       rename(分群類型 = cluster_label)
-    x
   }, striped = FALSE, bordered = TRUE, hover = TRUE)
-  
-  
+
+  output$cluster_filter_ui <- renderUI({
+    x <- pca_cluster_result()$data
+    groups <- sort(unique(x$cluster_label))
+    selectInput(
+      "cluster_filter",
+      "篩選群組：",
+      choices = c("全部群組" = "ALL", setNames(groups, groups)),
+      selected = "ALL"
+    )
+  })
+
+  output$cluster_member_table <- renderTable({
+    r <- pca_cluster_result()
+    x <- r$data
+    if (!is.null(input$cluster_filter) && input$cluster_filter != "ALL") {
+      x <- x %>% filter(cluster_label == input$cluster_filter)
+    }
+    x %>%
+      arrange(cluster_label, desc(composite_score)) %>%
+      transmute(
+        股票代號 = symbol,
+        股票名稱 = name,
+        產業 = industry,
+        所屬群組 = cluster_label,
+        `期間年化報酬` = fmt_pct(annual_return, 2, TRUE),
+        `期間年化波動` = fmt_pct(annual_volatility, 2, FALSE),
+        最大回撤 = fmt_pct(max_drawdown, 2, TRUE),
+        夏普比率 = ifelse(is.finite(sharpe), sprintf("%.3f", sharpe), "NA"),
+        `主模型綜合分數（參考）` = fmt_score(composite_score)
+      )
+  }, striped = FALSE, bordered = TRUE, hover = TRUE)
+
 
   # ==========================================================
   # 6-1. 不確定性分析：區塊拔靴法
   # ==========================================================
   
+  output$bootstrap_period_info <- renderUI({
+    n_day <- as.integer(if (is.null(input$bootstrap_window)) 252 else input$bootstrap_window)
+    d <- sort(unique(data()$date))
+    end_date <- max(d, na.rm=TRUE)
+    start_date <- window_start_from_dates(d, n_day, end_date)
+    div(
+      class="time-scope-bar",
+      strong("這次抽樣使用的資料： "),
+      paste0(window_label(n_day), "｜", format(start_date, "%Y-%m-%d"), " ～ ", format(end_date, "%Y-%m-%d"), "｜約 ", n_day, " 個交易日")
+    )
+  })
+
   bootstrap_result <- eventReactive(input$run_bootstrap, {
     req(input$bootstrap_stock)
     set.seed(20261023)
-    years <- as.integer(input$bootstrap_years)
+    n_day <- as.integer(input$bootstrap_window)
     block_length <- as.integer(input$bootstrap_block)
     reps <- as.integer(input$bootstrap_reps)
-    end_date <- latest_date()
-    start_date <- if (years > 0) end_date - round(365.25 * years) else earliest_date()
+    d <- sort(unique(data()$date))
+    end_date <- max(d, na.rm=TRUE)
+    start_date <- window_start_from_dates(d, n_day, end_date)
+
     x <- data() %>%
-      filter(date >= start_date, date <= end_date, symbol %in% dashboard_symbols, is.finite(log_return))
+      filter(
+        date >= start_date,
+        date <= end_date,
+        symbol %in% dashboard_symbols,
+        is.finite(log_return)
+      )
     m <- return_wide_matrix(x, dashboard_symbols)
-    req(!is.null(m), nrow(m) >= 126, "0050" %in% colnames(m), input$bootstrap_stock %in% colnames(m))
+    req(!is.null(m), nrow(m) >= 63, "0050" %in% colnames(m), input$bootstrap_stock %in% colnames(m))
+
     diffs <- rep(NA_real_, reps)
     withProgress(message = "正在重新抽樣並檢查結果…", value = 0, {
       for (b in seq_len(reps)) {
@@ -5229,7 +5709,13 @@ server <- function(input, output, session) {
     req(length(diffs) >= max(20, reps * 0.4))
     ci <- as.numeric(quantile(diffs, c(0.025, 0.975), na.rm=TRUE, names=FALSE))
     prob_above <- mean(diffs > 0, na.rm=TRUE)
-    label <- if (ci[1] > 0) "多數重新抽樣後仍高於 0050，結果相對穩定" else if (ci[2] < 0) "多數重新抽樣後仍低於 0050" else "結果有時高、有時低，暫時無法說優勢穩定"
+    label <- if (ci[1] > 0) {
+      "多數重新抽樣後仍高於 0050，結果相對穩定"
+    } else if (ci[2] < 0) {
+      "多數重新抽樣後仍低於 0050"
+    } else {
+      "結果有時高、有時低，暫時無法說優勢穩定"
+    }
     list(
       diffs=diffs,
       ci=ci,
@@ -5237,15 +5723,19 @@ server <- function(input, output, session) {
       label=label,
       reps=length(diffs),
       stock=input$bootstrap_stock,
-      years=years,
+      period_days=n_day,
+      start_date=start_date,
+      end_date=end_date,
       block=block_length
     )
   }, ignoreInit=TRUE)
-  
+
   output$bootstrap_summary_table <- renderTable({
     r <- bootstrap_result()
     data.frame(
       比較標的=get_stock_label(r$stock),
+      使用期間=window_label(r$period_days),
+      實際日期=paste0(format(r$start_date, "%Y-%m-%d"), " ～ ", format(r$end_date, "%Y-%m-%d")),
       有效重複次數=r$reps,
       區塊長度=paste0(r$block, " 個交易日"),
       平均分數差=sprintf("%+.2f", mean(r$diffs)),
@@ -5257,7 +5747,7 @@ server <- function(input, output, session) {
       stringsAsFactors=FALSE
     )
   }, striped=FALSE, bordered=TRUE, hover=TRUE)
-  
+
   output$bootstrap_diff_chart <- renderPlot({
     r <- bootstrap_result()
     x <- data.frame(diff=r$diffs)
@@ -5267,154 +5757,332 @@ server <- function(input, output, session) {
       geom_vline(xintercept=0, linetype="dashed", color="#d95b5b", linewidth=1) +
       geom_vline(xintercept=r$ci, linetype="dotted", color="#dca75a", linewidth=1) +
       labs(
-        title=paste0(get_stock_label(r$stock), " 相對 0050 的區塊拔靴分布"),
-        subtitle=paste0("95% 區間：", sprintf("%+.2f", r$ci[1]), " ～ ", sprintf("%+.2f", r$ci[2])),
+        title=paste0(get_stock_label(r$stock), " 相對 0050 的區塊拔靴分布｜", window_label(r$period_days)),
+        subtitle=paste0(format(r$start_date, "%Y-%m-%d"), " ～ ", format(r$end_date, "%Y-%m-%d"), "｜95% 區間：", sprintf("%+.2f", r$ci[1]), " ～ ", sprintf("%+.2f", r$ci[2])),
         x="綜合分數差（成分股－0050）",
         y="密度"
       ) +
       theme_minimal() +
       theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5))
   })
-  
+
+
   # ==========================================================
   # 6-2. 歷史回測：排名模型驗證
   # ==========================================================
   
   backtest_result <- eventReactive(input$run_backtest, {
     tryCatch({
-      lookback <- as.integer(input$backtest_lookback)
+      horizon <- as.integer(input$backtest_horizon)
       start_year <- as.integer(input$backtest_start_year)
-      max_score_year <- as.integer(format(latest_date(), "%Y")) - 1
-      first_possible <- as.integer(format(earliest_date(), "%Y")) + lookback
-      first_year <- max(start_year, first_possible)
-      if (!is.finite(first_year) || first_year > max_score_year) {
-        return(list(error = "目前資料期間不足以從這個年度開始回測，請把起始年度往後調整。"))
+      weight_profile <- if (is.null(input$backtest_weight_profile)) "baseline" else input$backtest_weight_profile
+      model_weights <- WEIGHT_PROFILES[[weight_profile]]
+      if (is.null(model_weights)) model_weights <- MODEL_WEIGHTS
+      all_dates <- sort(unique(data()$date))
+      req(length(all_dates) > 0)
+
+      # 為了驗證「目前同一套模型」，每個歷史評分點最多往回 3 年。
+      history_days <- TIME_WINDOWS[["3年"]]
+      min_cutoff_idx <- history_days
+      requested_idx <- which(as.integer(format(all_dates, "%Y")) >= start_year)[1]
+      if (!is.finite(requested_idx)) {
+        return(list(error = "找不到你指定起始年度之後的交易資料。"))
       }
-      years <- seq(first_year, max_score_year)
-      rows <- vector("list", length(years))
-      withProgress(message = "正在逐年回到過去重新排名…", value = 0, {
-        for (ii in seq_along(years)) {
-          y <- years[ii]
-          cutoff <- as.Date(paste0(y, "-12-31"))
-          hist_start <- as.Date(paste0(y - lookback + 1, "-01-01"))
+      first_idx <- max(min_cutoff_idx, requested_idx)
+      last_idx <- length(all_dates) - horizon
+      if (first_idx > last_idx) {
+        return(list(error = paste0(
+          "資料長度不足：目前選擇往後驗證 ", window_label(horizon),
+          "，但還需要保留完整的未來資料。請縮短驗證期間或把起始年度往前。"
+        )))
+      }
+
+      # 1週驗證若每週都重算太密、也高度重疊，因此最密只每月取一個排名點。
+      # 其他期間使用不重疊或近似不重疊的步長。
+      step_days <- max(horizon, 21)
+      cutoff_indices <- seq(first_idx, last_idx, by = step_days)
+      if (length(cutoff_indices) > 120) {
+        cutoff_indices <- cutoff_indices[round(seq(1, length(cutoff_indices), length.out=120))]
+      }
+
+      strategy_rows <- list()
+      detail_rows <- list()
+      corr_rows <- list()
+      counter <- 0
+
+      portfolio_stats <- function(fut_data, symbols) {
+        z <- fut_data %>%
+          filter(symbol %in% symbols, is.finite(log_return)) %>%
+          group_by(date) %>%
+          summarise(
+            portfolio_log_return = mean(log_return, na.rm=TRUE),
+            n_stock = sum(is.finite(log_return)),
+            .groups="drop"
+          ) %>%
+          filter(n_stock >= max(1, ceiling(length(symbols) * 0.5))) %>%
+          arrange(date)
+        if (nrow(z) < max(3, floor(horizon * 0.6))) {
+          return(c(total_return=NA_real_, annual_volatility=NA_real_, max_drawdown=NA_real_, sharpe=NA_real_))
+        }
+        r <- z$portfolio_log_return
+        wealth <- exp(cumsum(r))
+        av <- if (length(r) >= 5) sd(r, na.rm=TRUE) * sqrt(TRADING_DAYS_PER_YEAR) else NA_real_
+        c(
+          total_return = exp(sum(r, na.rm=TRUE)) - 1,
+          annual_volatility = av,
+          max_drawdown = min(drawdown_value(wealth), na.rm=TRUE),
+          sharpe = ifelse(is.finite(av) && av > 0, mean(r, na.rm=TRUE) * TRADING_DAYS_PER_YEAR / av, NA_real_)
+        )
+      }
+
+      withProgress(message = "正在回到過去重新計分並驗證…", value = 0, {
+        for (ii in seq_along(cutoff_indices)) {
+          cutoff_idx <- cutoff_indices[ii]
+          cutoff_date <- all_dates[cutoff_idx]
+          hist_start_idx <- max(1, cutoff_idx - history_days + 1)
+          hist_start_date <- all_dates[hist_start_idx]
+          future_end_date <- all_dates[min(length(all_dates), cutoff_idx + horizon)]
+
           hist <- data() %>%
-            filter(date >= hist_start, date <= cutoff, symbol %in% dashboard_symbols, is.finite(log_return))
+            filter(
+              date >= hist_start_date,
+              date <= cutoff_date,
+              symbol %in% dashboard_symbols,
+              is.finite(log_return)
+            )
           m <- return_wide_matrix(hist, dashboard_symbols)
+
           if (!is.null(m) && nrow(m) >= 252) {
-            scores <- score_return_matrix(m) %>%
+            scores <- score_return_matrix(m, model_weights = model_weights) %>%
               filter(symbol %in% stock_info$symbol, is.finite(composite_score)) %>%
               arrange(desc(composite_score))
+
             if (nrow(scores) >= 15) {
               top5 <- head(scores$symbol, 5)
               top10 <- head(scores$symbol, min(10, nrow(scores)))
               bottom10 <- tail(scores$symbol, min(10, nrow(scores)))
-              next_start <- as.Date(paste0(y + 1, "-01-01"))
-              next_end <- min(as.Date(paste0(y + 1, "-12-31")), latest_date())
+
               fut <- data() %>%
-                filter(date >= next_start, date <= next_end, symbol %in% unique(c("0050", top5, top10, bottom10)), is.finite(log_return))
-              stock_returns <- fut %>%
-                group_by(symbol) %>%
-                summarise(ret = exp(sum(log_return, na.rm=TRUE)) - 1, n = n(), .groups="drop")
-              min_days <- if ((y + 1) == as.integer(format(latest_date(), "%Y"))) 60 else 100
-              strategy_ret <- function(symbols) {
-                z <- stock_returns %>% filter(symbol %in% symbols, n >= min_days, is.finite(ret))
-                if (nrow(z) < max(2, ceiling(length(symbols) * 0.5))) return(NA_real_)
-                mean(z$ret, na.rm=TRUE)
+                filter(
+                  date > cutoff_date,
+                  date <= future_end_date,
+                  symbol %in% unique(c("0050", scores$symbol)),
+                  is.finite(log_return)
+                )
+
+              s_top5 <- portfolio_stats(fut, top5)
+              s_top10 <- portfolio_stats(fut, top10)
+              s_bottom10 <- portfolio_stats(fut, bottom10)
+              s_0050 <- portfolio_stats(fut, "0050")
+
+              counter <- counter + 1
+              for (nm in c("Top5", "Top10", "Bottom10", "0050")) {
+                st <- switch(nm, Top5=s_top5, Top10=s_top10, Bottom10=s_bottom10, `0050`=s_0050)
+                strategy_rows[[length(strategy_rows)+1]] <- data.frame(
+                  驗證序號 = counter,
+                  排名日期 = cutoff_date,
+                  評估截止 = future_end_date,
+                  策略 = nm,
+                  後續報酬 = unname(st["total_return"]),
+                  年化波動 = unname(st["annual_volatility"]),
+                  最大回撤 = unname(st["max_drawdown"]),
+                  夏普比率 = unname(st["sharpe"]),
+                  stringsAsFactors=FALSE
+                )
               }
-              bench <- stock_returns %>% filter(symbol == "0050", n >= min_days) %>% pull(ret)
-              rows[[ii]] <- data.frame(
-                排名年度 = y,
-                評估年度 = y + 1,
-                Top5 = strategy_ret(top5),
-                Top10 = strategy_ret(top10),
-                Bottom10 = strategy_ret(bottom10),
-                `0050` = ifelse(length(bench) == 1 && is.finite(bench), bench, NA_real_),
-                stringsAsFactors = FALSE,
-                check.names = FALSE
+
+              detail_rows[[length(detail_rows)+1]] <- data.frame(
+                驗證序號 = counter,
+                排名日期 = cutoff_date,
+                評估截止 = future_end_date,
+                Top5 = unname(s_top5["total_return"]),
+                Top10 = unname(s_top10["total_return"]),
+                Bottom10 = unname(s_bottom10["total_return"]),
+                `0050` = unname(s_0050["total_return"]),
+                stringsAsFactors=FALSE,
+                check.names=FALSE
+              )
+
+              # Spearman：現在分數越高，未來個股報酬是否也傾向越高？
+              indiv_future <- fut %>%
+                filter(symbol %in% scores$symbol) %>%
+                group_by(symbol) %>%
+                summarise(
+                  future_return = exp(sum(log_return, na.rm=TRUE)) - 1,
+                  n_obs = n(),
+                  .groups="drop"
+                ) %>%
+                filter(n_obs >= max(3, floor(horizon * 0.6)), is.finite(future_return))
+
+              corr_df <- scores %>%
+                select(symbol, composite_score) %>%
+                inner_join(indiv_future, by="symbol")
+
+              rho <- if (nrow(corr_df) >= 10) {
+                suppressWarnings(cor(corr_df$composite_score, corr_df$future_return, method="spearman", use="complete.obs"))
+              } else NA_real_
+
+              corr_rows[[length(corr_rows)+1]] <- data.frame(
+                驗證序號=counter,
+                排名日期=cutoff_date,
+                評估截止=future_end_date,
+                Spearman=rho,
+                個股數=nrow(corr_df),
+                stringsAsFactors=FALSE
               )
             }
           }
-          setProgress(value = ii / length(years), detail = paste0("正在處理排名年度 ", y))
+
+          setProgress(value = ii / length(cutoff_indices), detail = paste0("排名日期：", format(cutoff_date, "%Y-%m-%d")))
         }
       })
-      yearly <- bind_rows(rows) %>%
-        filter(if_any(c(Top5, Top10, Bottom10, `0050`), is.finite))
-      if (nrow(yearly) < 1) {
-        return(list(error = "目前條件下找不到足夠的完整年度資料。可以嘗試把起始年度往後調，或改用近 3 年資料排名。"))
+
+      strategy_long <- bind_rows(strategy_rows) %>% filter(is.finite(後續報酬))
+      detail <- bind_rows(detail_rows)
+      corr_detail <- bind_rows(corr_rows) %>% filter(is.finite(Spearman))
+
+      if (nrow(strategy_long) == 0 || nrow(detail) == 0) {
+        return(list(error = "目前條件下找不到足夠資料完成模型驗證。可以縮短未來驗證期間，或把起始年度往前調。"))
       }
-      long <- yearly %>%
-        pivot_longer(cols = all_of(c("Top5", "Top10", "Bottom10", "0050")), names_to="策略", values_to="年度報酬") %>%
-        filter(is.finite(年度報酬)) %>%
-        group_by(策略) %>%
-        arrange(評估年度, .by_group=TRUE) %>%
-        mutate(累積報酬 = cumprod(1 + 年度報酬) - 1) %>%
-        ungroup()
-      if (nrow(long) == 0) return(list(error = "有排名結果，但下一年度有效報酬資料不足，暫時無法畫出回測結果。"))
-      bench_by_year <- yearly %>% select(評估年度, benchmark = `0050`)
-      summary <- long %>%
-        left_join(bench_by_year, by="評估年度") %>%
+
+      benchmark_by_test <- strategy_long %>%
+        filter(策略 == "0050") %>%
+        select(驗證序號, benchmark_return = 後續報酬)
+
+      summary <- strategy_long %>%
+        left_join(benchmark_by_test, by="驗證序號") %>%
         group_by(策略) %>%
         summarise(
-          回測年度數 = n(),
-          累積報酬 = prod(1 + 年度報酬, na.rm=TRUE) - 1,
-          平均年度報酬 = mean(年度報酬, na.rm=TRUE),
-          年度報酬標準差 = ifelse(n() >= 2, sd(年度報酬, na.rm=TRUE), NA_real_),
-          最差年度 = min(年度報酬, na.rm=TRUE),
-          勝過0050比例 = ifelse(first(策略) == "0050", NA_real_, mean(年度報酬 > benchmark, na.rm=TRUE)),
+          有效驗證次數 = n(),
+          平均後續報酬 = mean(後續報酬, na.rm=TRUE),
+          中位數後續報酬 = median(後續報酬, na.rm=TRUE),
+          平均年化波動 = mean(年化波動, na.rm=TRUE),
+          平均最大回撤 = mean(最大回撤, na.rm=TRUE),
+          平均夏普 = mean(夏普比率, na.rm=TRUE),
+          勝過0050比例 = ifelse(first(策略) == "0050", NA_real_, mean(後續報酬 > benchmark_return, na.rm=TRUE)),
           .groups="drop"
         )
-      list(error = NULL, yearly=yearly, long=long, summary=summary)
+
+      corr_summary <- if (nrow(corr_detail) > 0) {
+        data.frame(
+          有效驗證次數 = nrow(corr_detail),
+          平均Spearman = mean(corr_detail$Spearman, na.rm=TRUE),
+          中位數Spearman = median(corr_detail$Spearman, na.rm=TRUE),
+          正相關比例 = mean(corr_detail$Spearman > 0, na.rm=TRUE),
+          stringsAsFactors=FALSE
+        )
+      } else {
+        data.frame(
+          有效驗證次數 = 0,
+          平均Spearman = NA_real_,
+          中位數Spearman = NA_real_,
+          正相關比例 = NA_real_
+        )
+      }
+
+      list(
+        error=NULL,
+        strategy_long=strategy_long,
+        detail=detail,
+        summary=summary,
+        corr_detail=corr_detail,
+        corr_summary=corr_summary,
+        horizon=horizon,
+        step_days=step_days,
+        history_days=history_days,
+        weight_profile=weight_profile,
+        model_weights=model_weights
+      )
     }, error = function(e) {
-      list(error = paste0("回測暫時無法完成：", conditionMessage(e)))
+      list(error = paste0("模型驗證暫時無法完成：", conditionMessage(e)))
     })
   }, ignoreInit=TRUE)
-  
+
   output$backtest_status <- renderUI({
     r <- backtest_result()
     if (!is.null(r$error)) {
-      div(class = "warning-note", strong("目前無法完成回測： "), r$error)
+      div(class = "warning-note", strong("目前無法完成驗證： "), r$error)
     } else {
-      div(class = "reading-guide", strong("回測完成： "), "下方結果都是用『當時以前的資料』重新排名後，再觀察下一年度，不會把未來資料偷拿來算當時的分數。")
+      n_test <- nrow(r$detail)
+      low_sample <- n_test < 5
+      div(
+        class = if (low_sample) "warning-note" else "reading-guide",
+        strong(if (low_sample) "樣本數偏少： " else "模型驗證完成： "),
+        paste0(
+          "權重：", WEIGHT_PROFILE_LABELS[[r$weight_profile]], "；後續觀察期間：", window_label(r$horizon),
+          "；共有 ", n_test, " 次有效驗證。",
+          if (r$horizon == 5) "1週驗證每月取一個排名點，避免結果高度重疊。" else "",
+          if (low_sample) " 長期驗證只有少量樣本，勝率請勿單獨解讀。" else ""
+        )
+      )
     }
   })
-  
+
   output$backtest_cumulative_chart <- renderPlot({
     r <- backtest_result()
-    req(is.null(r$error), nrow(r$long) > 0)
-    ggplot(r$long, aes(x=評估年度, y=累積報酬, color=策略, group=策略)) +
+    req(is.null(r$error), nrow(r$strategy_long) > 0)
+    ggplot(r$strategy_long, aes(x=排名日期, y=後續報酬, color=策略, group=策略)) +
       geom_hline(yintercept=0, linetype="dashed", color="#94a3b8") +
-      geom_line(linewidth=1.15) +
-      geom_point(size=2.3) +
-      scale_color_manual(values=c("Top5"="#6f9fd0", "Top10"="#a28bd2", "Bottom10"="#dfb46f", "0050"="#5b8ecb")) +
+      geom_line(linewidth=0.8, alpha=0.75) +
+      geom_point(size=2.0) +
+      scale_color_manual(values=c("Top5"="#6f9fd0", "Top10"="#9a7fd1", "Bottom10"="#d6a45f", "0050"="#4f86c6")) +
       scale_y_continuous(labels=function(z) paste0(round(z*100,1), "%")) +
-      labs(title="排名模型歷史回測：累積表現", x="評估年度", y="累積報酬", color="比較組別") +
+      labs(
+        title=paste0("評分模型驗證｜往後 ", window_label(r$horizon), " 的實際報酬"),
+        subtitle="每一個點都先用當時以前的資料重新評分，再觀察之後；不是事後挑選買賣日期",
+        x="當時的排名日期",
+        y="之後實際報酬",
+        color="比較組別"
+      ) +
       theme_minimal() +
-      theme(plot.title=element_text(hjust=0.5, face="bold"), legend.position="bottom")
+      theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5), legend.position="bottom")
   })
-  
+
   output$backtest_summary_table <- renderTable({
     r <- backtest_result()
     req(is.null(r$error), nrow(r$summary) > 0)
-    r$summary %>% mutate(
-      累積報酬=fmt_pct(累積報酬,2,TRUE),
-      平均年度報酬=fmt_pct(平均年度報酬,2,TRUE),
-      年度報酬標準差=fmt_pct(年度報酬標準差,2,FALSE),
-      最差年度=fmt_pct(最差年度,2,TRUE),
-      勝過0050比例=ifelse(is.finite(勝過0050比例), paste0(round(勝過0050比例*100,1), "%"), "—")
+    r$summary %>%
+      mutate(
+        平均後續報酬=fmt_pct(平均後續報酬,2,TRUE),
+        中位數後續報酬=fmt_pct(中位數後續報酬,2,TRUE),
+        平均年化波動=fmt_pct(平均年化波動,2,FALSE),
+        平均最大回撤=fmt_pct(平均最大回撤,2,TRUE),
+        平均夏普=ifelse(is.finite(平均夏普), sprintf("%.3f", 平均夏普), "NA"),
+        勝過0050比例=ifelse(is.finite(勝過0050比例), paste0(round(勝過0050比例*100,1), "%"), "—")
+      )
+  }, striped=FALSE, bordered=TRUE, hover=TRUE)
+
+  output$backtest_rank_corr_table <- renderTable({
+    r <- backtest_result()
+    req(is.null(r$error))
+    x <- r$corr_summary
+    x %>% mutate(
+      平均Spearman = ifelse(is.finite(平均Spearman), sprintf("%.3f", 平均Spearman), "NA"),
+      中位數Spearman = ifelse(is.finite(中位數Spearman), sprintf("%.3f", 中位數Spearman), "NA"),
+      正相關比例 = ifelse(is.finite(正相關比例), paste0(round(正相關比例*100,1), "%"), "NA"),
+      解讀 = case_when(
+        is.finite(r$corr_summary$平均Spearman) & r$corr_summary$平均Spearman > 0.10 ~ "整體偏正：高分股票之後較常排前面",
+        is.finite(r$corr_summary$平均Spearman) & r$corr_summary$平均Spearman < -0.10 ~ "整體偏負：需要檢查評分方向或權重",
+        TRUE ~ "接近零：目前沒有明顯排序關係"
+      )
     )
   }, striped=FALSE, bordered=TRUE, hover=TRUE)
-  
+
   output$backtest_yearly_table <- renderTable({
     r <- backtest_result()
-    req(is.null(r$error), nrow(r$yearly) > 0)
-    r$yearly %>% mutate(
-      Top5=fmt_pct(Top5,2,TRUE),
-      Top10=fmt_pct(Top10,2,TRUE),
-      Bottom10=fmt_pct(Bottom10,2,TRUE),
-      `0050`=fmt_pct(`0050`,2,TRUE)
-    )
+    req(is.null(r$error), nrow(r$detail) > 0)
+    r$detail %>%
+      mutate(
+        排名日期=format(as.Date(排名日期), "%Y-%m-%d"),
+        評估截止=format(as.Date(評估截止), "%Y-%m-%d"),
+        Top5=fmt_pct(Top5,2,TRUE),
+        Top10=fmt_pct(Top10,2,TRUE),
+        Bottom10=fmt_pct(Bottom10,2,TRUE),
+        `0050`=fmt_pct(`0050`,2,TRUE)
+      )
   }, striped=FALSE, bordered=TRUE, hover=TRUE)
-  
+
+
   # ==========================================================
   # 7. 產業比較
   # ==========================================================
