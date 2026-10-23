@@ -1,4 +1,4 @@
-# 0050 投資研究 Dashboard v4：統一時間尺度＋滾動評分＋PCA分群透明化＋彈性模型驗證
+# 0050 投資研究 Dashboard v4.2：分段合併＋啟動防呆＋統一時間尺度＋PCA分群＋模型驗證
 # Connect Cloud auto-publish test
 # ============================================================
 # 0050 Investment Research Dashboard
