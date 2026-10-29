@@ -6515,7 +6515,7 @@ server <- function(input, output, session) {
 
     req(input$bootstrap_stock)
 
-    set.seed(20261023)
+    
 
     window_days <- as.integer(input$bootstrap_window)
     block_length <- as.integer(input$bootstrap_block)
